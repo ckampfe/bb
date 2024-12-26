@@ -1,0 +1,23 @@
+[package]
+name = "bb"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+base64 = "0.22"
+bitvec = "1"
+bytes = "1"
+futures = "0.3"
+hex = "0.4"
+itoa = "1"
+nom = "7"
+rand = "0.8"
+reqwest = "0.12"
+serde = "1"
+sha1_smol = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1.17"
+tokio-util = "0.7"
+tracing = "0.1"
+urlencoding = "2"
