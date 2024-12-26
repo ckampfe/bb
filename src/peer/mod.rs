@@ -96,10 +96,13 @@ fn peer_loop(
 
         // send the initial bitfield, we do not treat this as part of the handshake
         {
-            let torrents = crate::TORRENTS.read().await;
+            // get a read lock on the torrents that only lives for this scope,
+            // so we don't hold it for the life of the whole task (which is indefinite)
+            let torrents = timeout!(crate::TORRENTS.read(), 5).await?;
+
             if let Some(torrent) = torrents.get(&info_hash) {
                 if let Ok(my_pieces) = torrent.get_pieces().await {
-                    writer.send(Frame::Bitfield { pieces: my_pieces }).await?;
+                    timeout!(writer.send(Frame::Bitfield { pieces: my_pieces }), 5).await??;
                 } else {
                     return Ok(())
                 };

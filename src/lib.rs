@@ -15,9 +15,12 @@ pub enum Error {
     Torrent(#[from] torrent::Error),
 }
 
+// is this a good idea? bad idea?
+// should we have an object that holds this data instead of it being a static? idk
 static TORRENTS: tokio::sync::RwLock<BTreeMap<InfoHash, TorrentHandle>> =
     tokio::sync::RwLock::const_new(BTreeMap::new());
 
+// todo do this by config
 static MAX_CONNECTIONS: tokio::sync::Semaphore = Semaphore::const_new(100);
 
 pub async fn new_torrent<P: AsRef<Path>>(
