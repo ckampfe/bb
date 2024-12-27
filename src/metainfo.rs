@@ -1,7 +1,5 @@
-use crate::{
-    bencode::{self, Bencode},
-    InfoHash,
-};
+use crate::bencode::{self, Bencode};
+use crate::InfoHash;
 
 #[derive(Debug)]
 pub(crate) struct MetaInfo {

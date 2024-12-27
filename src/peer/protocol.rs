@@ -2,8 +2,6 @@ use crate::torrent::Pieces;
 use crate::InfoHash;
 use bytes::{Buf, BufMut, BytesMut};
 use thiserror::Error;
-use tokio::io::{AsyncReadExt, AsyncWriteExt, BufWriter};
-use tokio::net::TcpStream;
 use tokio_util::codec::{Decoder, Encoder};
 
 use super::PeerId;

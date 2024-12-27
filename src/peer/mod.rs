@@ -1,16 +1,14 @@
-use std::net::IpAddr;
-use std::sync::Arc;
-
 use crate::torrent::{self, PeerId, Pieces};
 use crate::{timeout, InfoHash};
 use bitvec::{bitvec, order::Msb0};
-use bytes::{Buf, BufMut};
 use futures::sink::SinkExt;
 use protocol::{Frame, PeerProtocol};
+use std::net::IpAddr;
+use std::sync::Arc;
 use thiserror::Error;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
-use tokio::net::{TcpStream, ToSocketAddrs};
+use tokio::net::TcpStream;
 use tokio::sync::{mpsc, TryAcquireError};
 use tokio::{select, task::JoinHandle, time::error::Elapsed};
 use tokio_stream::StreamExt;
