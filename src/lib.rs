@@ -2,7 +2,7 @@ use bencode::Bencode;
 use std::{collections::BTreeMap, path::Path};
 use thiserror::Error;
 use tokio::sync::Semaphore;
-use torrent::{InfoHash, Pieces, TorrentHandle, TorrentState};
+use torrent::{InfoHash, Pieces, TorrentHandle};
 
 mod bencode;
 mod metainfo;
@@ -21,17 +21,17 @@ static TORRENTS: tokio::sync::RwLock<BTreeMap<InfoHash, TorrentHandle>> =
     tokio::sync::RwLock::const_new(BTreeMap::new());
 
 // todo do this by config
-static MAX_CONNECTIONS: tokio::sync::Semaphore = Semaphore::const_new(100);
+static GLOBAL_MAX_CONNECTIONS: tokio::sync::Semaphore = Semaphore::const_new(100);
 
 pub async fn new_torrent<P: AsRef<Path>>(
     dot_torrent_path: P,
     data_path: P,
     options: torrent::Options,
 ) -> Result<InfoHash, Error> {
-    let (info_hash, torrent) = TorrentState::new(dot_torrent_path, data_path, options).await?;
+    let (info_hash, torrent_handle) = torrent::new(dot_torrent_path, data_path, options).await?;
     {
         let mut torrents = TORRENTS.write().await;
-        torrents.insert(info_hash, torrent);
+        torrents.insert(info_hash, torrent_handle);
     }
 
     Ok(info_hash)
@@ -50,7 +50,7 @@ pub async fn verify_local_data(info_hash: InfoHash) -> Result<(), Error> {
 pub async fn force_announce(info_hash: InfoHash) -> Result<Bencode, Error> {
     let torrents = TORRENTS.read().await;
     if let Some(torrent) = torrents.get(&info_hash) {
-        let announce_response = torrent.announce().await?;
+        let announce_response = torrent.force_announce().await?;
         Ok(announce_response)
     } else {
         panic!()
@@ -70,7 +70,7 @@ pub async fn get_pieces(info_hash: InfoHash) -> Result<Pieces, Error> {
 pub async fn get_state(info_hash: InfoHash) -> Result<String, Error> {
     let torrents = TORRENTS.read().await;
     if let Some(torrent) = torrents.get(&info_hash) {
-        let pieces = torrent.get_state().await?;
+        let pieces = torrent.get_state_debug_string().await?;
         Ok(pieces)
     } else {
         panic!()
