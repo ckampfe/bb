@@ -35,9 +35,9 @@ impl HandshakeProtocol {
             remote_peer_id,
         }
     }
-}
 
-const HANDSHAKE_LENGTH: usize = 1 + 19 + 8 + 20 + 20;
+    const HANDSHAKE_LENGTH: usize = 1 + 19 + 8 + 20 + 20;
+}
 
 impl Decoder for HandshakeProtocol {
     type Item = PeerId;
@@ -45,12 +45,12 @@ impl Decoder for HandshakeProtocol {
     type Error = std::io::Error;
 
     fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
-        if src.len() < HANDSHAKE_LENGTH {
+        if src.len() < Self::HANDSHAKE_LENGTH {
             // Not enough data
             return Ok(None);
         }
 
-        if src.len() > HANDSHAKE_LENGTH {
+        if src.len() > Self::HANDSHAKE_LENGTH {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::FileTooLarge,
                 format!("Frame of length {} is too large.", src.len()),
@@ -90,6 +90,10 @@ impl Decoder for HandshakeProtocol {
         let challenge_peer_id: [u8; 20] = challenge_peer_id.try_into().unwrap();
         let challenge_peer_id = PeerId(challenge_peer_id);
 
+        // if there is a peer id, we compare it.
+        // if not, the tracker is using compact peers,
+        // so we don't yet have a peer id until the peer sends it to us,
+        // so we can't compare it with something the tracker never gave us.
         if let Some(remote_peer_id) = self.remote_peer_id {
             if challenge_peer_id != remote_peer_id {
                 return Err(std::io::Error::new(
