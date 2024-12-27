@@ -5,20 +5,22 @@ use bytes::{Buf, BufMut};
 use futures::sink::SinkExt;
 use protocol::{Frame, PeerProtocol};
 use thiserror::Error;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{TcpStream, ToSocketAddrs};
 use tokio::sync::{mpsc, TryAcquireError};
 use tokio::{select, task::JoinHandle, time::error::Elapsed};
 use tokio_stream::StreamExt;
-use tokio_util::codec::{Decoder, FramedRead, FramedWrite};
+use tokio_util::codec::{FramedRead, FramedWrite};
 
 mod protocol;
+
+const TWO_MINUTES: u64 = 2 * 60;
 
 #[derive(Debug, Error)]
 pub(crate) enum Error {
     #[error("couldn't send control message")]
-    ControlError(#[from] tokio::sync::mpsc::error::SendError<TorrentToPeer>),
+    Control(#[from] tokio::sync::mpsc::error::SendError<TorrentToPeer>),
     #[error("timed out")]
     Timeout(#[from] Elapsed),
     #[error("io")]
@@ -39,9 +41,12 @@ pub enum TorrentToPeer {
     Shutdown,
 }
 
-struct PeerState {
+struct State {
+    /// me
     my_id: PeerId,
+    /// send messages to the owning torrent
     torrent_tx: mpsc::Sender<PeerToTorrent>,
+    /// the pieces the remote peer has
     peer_pieces: Pieces,
     i_am_choking_peer: bool,
     i_am_interested_in_peer: bool,
@@ -57,7 +62,7 @@ pub(crate) async fn new<A: ToSocketAddrs>(
     remote_peer_id: PeerId,
     torrent_tx: mpsc::Sender<PeerToTorrent>,
 ) -> Result<PeerHandle, Error> {
-    let permit = crate::MAX_CONNECTIONS.try_acquire()?;
+    let permit = crate::GLOBAL_MAX_CONNECTIONS.try_acquire()?;
 
     let mut socket = tokio::net::TcpStream::connect(addr).await?;
 
@@ -78,6 +83,7 @@ pub(crate) async fn accept_peer_connection(socket: TcpStream) -> Result<PeerHand
     todo!()
 }
 
+/// the peer's main processing loop
 fn peer_loop(
     info_hash: InfoHash,
     my_id: PeerId,
@@ -111,7 +117,7 @@ fn peer_loop(
             }
         };
 
-        let mut state = PeerState {
+        let mut state = State {
             my_id,
             torrent_tx,
             peer_pieces: bitvec![u8, Msb0; 0; pieces.len()],
@@ -123,16 +129,6 @@ fn peer_loop(
 
         loop {
             select! {
-                m = peer_rx.recv() => {
-                    match m {
-                        None => break,
-                        Some(m) => {
-                            match m {
-                                TorrentToPeer::Shutdown => break,
-                            }
-                        }
-                    }
-                }
                 m = reader.next() => {
                     match m {
                         Some(Ok(frame)) => {
@@ -161,6 +157,16 @@ fn peer_loop(
                         None => break
                     }
                 }
+                m = peer_rx.recv() => {
+                    match m {
+                        None => break,
+                        Some(m) => {
+                            match m {
+                                TorrentToPeer::Shutdown => break,
+                            }
+                        }
+                    }
+                }
             }
         }
 
@@ -173,30 +179,15 @@ fn peer_loop(
     }
 }
 
-async fn handle_request(
-    state: &PeerState,
-    index: u32,
-    begin: u32,
-    length: u32,
-) -> Result<(), Error> {
+async fn handle_request(state: &State, index: u32, begin: u32, length: u32) -> Result<(), Error> {
     todo!()
 }
 
-async fn handle_piece(
-    state: &PeerState,
-    index: u32,
-    begin: u32,
-    block: &[u8],
-) -> Result<(), Error> {
+async fn handle_piece(state: &State, index: u32, begin: u32, block: &[u8]) -> Result<(), Error> {
     todo!()
 }
 
-async fn handle_cancel(
-    state: &PeerState,
-    index: u32,
-    begin: u32,
-    length: u32,
-) -> Result<(), Error> {
+async fn handle_cancel(state: &State, index: u32, begin: u32, length: u32) -> Result<(), Error> {
     todo!()
 }
 
@@ -255,7 +246,7 @@ async fn receive_handshake(
     let mut challenge_info_hash = vec![0; 20];
     challenge_info_hash.put(&mut take);
 
-    if info_hash.0 != &challenge_info_hash[..] {
+    if info_hash.0 != challenge_info_hash[..] {
         return Err(Error::Handshake("info hash did not match"));
     }
 
@@ -265,7 +256,7 @@ async fn receive_handshake(
     let mut challenge_peer_id = vec![0; 20];
     challenge_peer_id.put(&mut take);
 
-    if remote_peer_id.0 != &challenge_peer_id[..] {
+    if remote_peer_id.0 != challenge_peer_id[..] {
         return Err(Error::Handshake("peer id did not match"));
     }
 
@@ -274,7 +265,9 @@ async fn receive_handshake(
 
 #[derive(Debug)]
 pub(crate) struct PeerHandle {
+    /// this is the channel by which we get messages to the peer
     peer_tx: mpsc::Sender<TorrentToPeer>,
+    /// in case we need to kill the task or figure out why it panicked
     task_handle: JoinHandle<Result<(), Error>>,
 }
 
