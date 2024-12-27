@@ -1,5 +1,5 @@
-use crate::timeout;
-use crate::torrent::{InfoHash, PeerId, Pieces};
+use crate::torrent::{PeerId, Pieces};
+use crate::{timeout, InfoHash};
 use bitvec::{bitvec, order::Msb0};
 use bytes::{Buf, BufMut};
 use futures::sink::SinkExt;

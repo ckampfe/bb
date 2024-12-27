@@ -19,17 +19,6 @@ use tracing::debug;
 
 pub type Pieces = BitVec<u8, bitvec::order::Msb0>;
 
-/// uniquely identifies a torrent
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub struct InfoHash(pub [u8; 20]);
-
-impl Debug for InfoHash {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let base64 = base64::prelude::BASE64_STANDARD.encode(self.0);
-        write!(f, "{}", base64)
-    }
-}
-
 /// uniquely identifies a peer
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct PeerId(pub [u8; 20]);
@@ -145,7 +134,7 @@ pub(crate) async fn new<P: AsRef<Path>>(
     dot_torrent_path: P,
     data_path: P,
     options: Options,
-) -> Result<(InfoHash, TorrentHandle), Error> {
+) -> Result<(crate::InfoHash, TorrentHandle), Error> {
     let dot_torrent_data = tokio::fs::read(&dot_torrent_path)
         .await
         .map_err(|e| Error::DotTorrentRead(e.to_string()))?;

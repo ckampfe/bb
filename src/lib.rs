@@ -1,13 +1,26 @@
+use base64::Engine;
 use bencode::Bencode;
+use std::fmt::Debug;
 use std::{collections::BTreeMap, path::Path};
 use thiserror::Error;
 use tokio::sync::Semaphore;
-use torrent::{InfoHash, Pieces, TorrentHandle};
+use torrent::{Pieces, TorrentHandle};
 
 mod bencode;
 mod metainfo;
 mod peer;
 pub mod torrent;
+
+/// uniquely identifies a torrent
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct InfoHash(pub [u8; 20]);
+
+impl Debug for InfoHash {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let base64 = base64::prelude::BASE64_STANDARD.encode(self.0);
+        write!(f, "{}", base64)
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum Error {
