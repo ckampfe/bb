@@ -2,10 +2,10 @@ use nom::branch::alt;
 use nom::bytes::complete::{tag, take};
 use nom::character::complete::digit1;
 use nom::combinator::opt;
-use nom::error::{ErrorKind, ParseError};
+use nom::error::ErrorKind;
 use nom::multi::many0;
 use nom::IResult;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::BTreeMap;
 use std::fmt::Debug;
 use std::io::Write;
 use std::num::ParseIntError;
@@ -23,10 +23,7 @@ pub enum Bencode {
 impl Debug for Bencode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Bencode::Dict(ref btree_map) => f
-                .debug_map()
-                .entries(btree_map.iter().map(|(k, v)| (k, v)))
-                .finish(),
+            Bencode::Dict(ref btree_map) => f.debug_map().entries(btree_map.iter()).finish(),
             Bencode::List(vec) => f.debug_list().entries(vec.iter()).finish(),
             Bencode::Integer(i) => write!(f, "Integer({})", i),
 
@@ -102,22 +99,6 @@ impl<I> nom::error::ParseError<I> for CustomError<I> {
     }
 
     fn append(_: I, _: ErrorKind, other: Self) -> Self {
-        #[derive(Debug, PartialEq)]
-        pub enum CustomError<I> {
-            MyError,
-            Nom(I, ErrorKind),
-        }
-
-        impl<I> ParseError<I> for CustomError<I> {
-            fn from_error_kind(input: I, kind: ErrorKind) -> Self {
-                CustomError::Nom(input, kind)
-            }
-
-            fn append(_: I, _: ErrorKind, other: Self) -> Self {
-                other
-            }
-        }
-
         other
     }
 }
@@ -136,76 +117,44 @@ pub(crate) fn decode(input: &[u8]) -> Result<Bencode, Error> {
 }
 
 pub(crate) fn encode<W: Write>(bencode: &Bencode, out: &mut W) -> Result<(), Error> {
-    let mut to_encode = VecDeque::new();
-    to_encode.push_back(ToEncode::Bencode(bencode));
+    match bencode {
+        Bencode::Integer(i) => {
+            out.write_all(b"i")?;
+            let mut buffer = itoa::Buffer::new();
+            let i_out = buffer.format(*i).as_bytes();
+            out.write_all(i_out)?;
+            out.write_all(b"e")?;
+        }
+        Bencode::ByteString(s) => {
+            let len = s.len();
+            let mut buffer = itoa::Buffer::new();
+            let len_out = buffer.format(len).as_bytes();
+            out.write_all(len_out)?;
+            out.write_all(b":")?;
+            out.write_all(s)?;
+        }
+        Bencode::Dict(btree_map) => {
+            out.write_all(b"d")?;
 
-    while let Some(el) = to_encode.pop_front() {
-        match el {
-            ToEncode::Bencode(bencode) => match bencode {
-                Bencode::Integer(i) => {
-                    out.write_all(b"i")?;
-                    let mut buffer = itoa::Buffer::new();
-                    let i_out = buffer.format(*i).as_bytes();
-                    out.write_all(i_out)?;
-                    out.write_all(b"e")?;
-                }
-                Bencode::ByteString(s) => {
-                    let len = s.len();
-                    let mut buffer = itoa::Buffer::new();
-                    let len_out = buffer.format(len).as_bytes();
-                    out.write_all(len_out)?;
-                    out.write_all(b":")?;
-                    out.write_all(&s)?;
-                }
-                Bencode::Dict(btree_map) => {
-                    to_encode.push_back(ToEncode::D);
-
-                    for (k, v) in btree_map {
-                        to_encode.push_back(ToEncode::Key(k));
-                        to_encode.push_back(ToEncode::Bencode(v));
-                    }
-
-                    to_encode.push_back(ToEncode::E);
-                }
-                Bencode::List(vec) => {
-                    to_encode.push_back(ToEncode::L);
-
-                    for el in vec {
-                        to_encode.push_back(ToEncode::Bencode(el));
-                    }
-
-                    to_encode.push_back(ToEncode::E);
-                }
-            },
-            ToEncode::Key(s) => {
-                let len = s.len();
-                let mut buffer = itoa::Buffer::new();
-                let len_out = buffer.format(len).as_bytes();
-                out.write_all(len_out)?;
-                out.write_all(b":")?;
-                out.write_all(s.as_bytes())?;
+            for (k, v) in btree_map {
+                encode(&Bencode::ByteString(k.as_bytes().to_vec()), out)?;
+                encode(v, out)?;
             }
-            ToEncode::D => {
-                out.write_all(b"d")?;
+
+            out.write_all(b"e")?;
+        }
+        Bencode::List(vec) => {
+            out.write_all(b"l")?;
+
+            for el in vec {
+                encode(el, out)?;
             }
-            ToEncode::E => {
-                out.write_all(b"e")?;
-            }
-            ToEncode::L => {
-                out.write_all(b"l")?;
-            }
+
+            out.write_all(b"e")?;
         }
     }
 
     Ok(())
-}
-
-enum ToEncode<'input> {
-    Bencode(&'input Bencode),
-    Key(&'input str),
-    D,
-    E,
-    L,
 }
 
 fn any(input: &[u8]) -> IResult<&[u8], Bencode, CustomError<&[u8]>> {
@@ -283,9 +232,32 @@ fn string(input: &[u8]) -> IResult<&[u8], Bencode, CustomError<&[u8]>> {
 mod tests {
     use super::*;
 
+    impl From<String> for Bencode {
+        fn from(value: String) -> Self {
+            Bencode::ByteString(value.as_bytes().to_vec())
+        }
+    }
+
+    impl From<&'static str> for Bencode {
+        fn from(value: &'static str) -> Self {
+            Bencode::ByteString(value.as_bytes().to_vec())
+        }
+    }
+
+    impl From<i64> for Bencode {
+        fn from(value: i64) -> Self {
+            Bencode::Integer(value)
+        }
+    }
+
     #[test]
-    fn it_works() {
+    fn roundtrips() {
         let input = std::fs::read("a8dmfmt66t211.png.torrent").unwrap();
-        let _decoded = decode(&input).unwrap();
+        let decoded = decode(&input).unwrap();
+        let mut out = vec![];
+        encode(&decoded, &mut out).unwrap();
+
+        assert_eq!(input.len(), out.len());
+        assert_eq!(input, out);
     }
 }
