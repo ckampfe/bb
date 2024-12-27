@@ -1,9 +1,12 @@
 use crate::torrent::Pieces;
+use crate::InfoHash;
 use bytes::{Buf, BufMut, BytesMut};
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufWriter};
 use tokio::net::TcpStream;
 use tokio_util::codec::{Decoder, Encoder};
+
+use super::PeerId;
 
 #[derive(Debug, Error)]
 pub(super) enum Error {
@@ -19,6 +22,86 @@ pub(super) enum Error {
 
 const ONE_MB: usize = 1048576;
 const FRAME_RECEIVE_MAX: usize = 8 * ONE_MB;
+
+pub(super) struct HandshakeProtocol {
+    info_hash: InfoHash,
+    remote_peer_id: Option<PeerId>,
+}
+
+impl HandshakeProtocol {
+    pub(super) fn new(info_hash: InfoHash, remote_peer_id: Option<PeerId>) -> Self {
+        Self {
+            info_hash,
+            remote_peer_id,
+        }
+    }
+}
+
+const HANDSHAKE_LENGTH: usize = 1 + 19 + 8 + 20 + 20;
+
+impl Decoder for HandshakeProtocol {
+    type Item = PeerId;
+
+    type Error = std::io::Error;
+
+    fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
+        if src.len() < HANDSHAKE_LENGTH {
+            // Not enough data
+            return Ok(None);
+        }
+
+        if src.len() > HANDSHAKE_LENGTH {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::FileTooLarge,
+                format!("Frame of length {} is too large.", src.len()),
+            ));
+        }
+
+        let len_byte = src.get_u8();
+        if len_byte != 19 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "first byte not 19",
+            ));
+        }
+
+        if &src[..19] != b"BitTorrent protocol" {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Not 'BitTorrent protocol'",
+            ));
+        }
+
+        src.advance(19);
+
+        // ignore protocol options
+        src.advance(8);
+
+        if &src[..20] != &self.info_hash.0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Bad info hash",
+            ));
+        }
+
+        src.advance(20);
+
+        let challenge_peer_id = &src[..20];
+        let challenge_peer_id: [u8; 20] = challenge_peer_id.try_into().unwrap();
+        let challenge_peer_id = PeerId(challenge_peer_id);
+
+        if let Some(remote_peer_id) = self.remote_peer_id {
+            if challenge_peer_id != remote_peer_id {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "Bad info peer id",
+                ));
+            }
+        }
+
+        Ok(Some(challenge_peer_id))
+    }
+}
 
 /// A marker type on which to implement `Decoder` and `Encoder`.
 /// We then pass this type to `FramedRead` and `FramedWrite`

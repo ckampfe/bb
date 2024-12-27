@@ -34,7 +34,7 @@ static TORRENTS: tokio::sync::RwLock<BTreeMap<InfoHash, TorrentHandle>> =
     tokio::sync::RwLock::const_new(BTreeMap::new());
 
 // todo do this by config
-static GLOBAL_MAX_CONNECTIONS: tokio::sync::Semaphore = Semaphore::const_new(100);
+static GLOBAL_MAX_CONNECTIONS: tokio::sync::Semaphore = Semaphore::const_new(200);
 
 pub async fn new_torrent<P: AsRef<Path>>(
     dot_torrent_path: P,

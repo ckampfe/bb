@@ -1,19 +1,24 @@
 use crate::bencode::{self, Bencode};
 use crate::metainfo::MetaInfo;
-use crate::peer::PeerHandle;
-use crate::timeout;
+use crate::peer::{self, PeerHandle};
+use crate::{timeout, InfoHash};
 use base64::Engine;
 use bitvec::prelude::*;
 use bitvec::vec::BitVec;
+use rand::seq::SliceRandom;
 use rand::{Rng, RngCore};
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashSet};
 use std::fmt::{Debug, Display};
+use std::net::IpAddr;
 use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
+use std::sync::Arc;
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio::select;
+use tokio::sync::{mpsc, Semaphore};
 use tokio::time::Interval;
 use tracing::debug;
 
@@ -65,6 +70,7 @@ pub(crate) enum Message {
 struct State {
     /// the channel to communicate to the runtime itself, if need be
     // rt_tx: tokio::sync::mpsc::Sender<runtime::Message>,
+    info_hash: InfoHash,
     /// the metainfo parsed from the .torrent file
     metainfo: MetaInfo,
     /// location of the .torrent
@@ -76,14 +82,15 @@ struct State {
     /// the pieces of the torrent that we have
     pieces: Pieces,
     /// peer's we're connected to
-    connected_peers: BTreeMap<PeerId, PeerHandle>,
+    connected_peers: Vec<PeerHandle>,
     /// peers, as we get them from the tracker
     /// a hashet ensures that we only ever have one entry per unique peer
     available_peers: HashSet<AvailablePeer>,
+    peer_stats: BTreeMap<PeerId, PeerStats>,
     /// the last announce we've received from the tracker
     last_announce: Option<Bencode>,
     // ("peer_id", self.peer_id),
-    peer_id: PeerId,
+    my_id: PeerId,
     // ("port", self.port),
     port: u16,
     // ("left", self.left),
@@ -94,6 +101,15 @@ struct State {
     downloaded_bytes: u64,
     // ("event", self.state),
     state: TrackerState,
+    max_peer_connections: Arc<Semaphore>,
+    torrent_tx: mpsc::Sender<Message>,
+}
+
+/// stats for a single peer
+#[derive(Debug)]
+struct PeerStats {
+    downloaded: usize,
+    uploaded: usize,
 }
 
 #[derive(Debug)]
@@ -117,11 +133,15 @@ impl Display for TrackerState {
 
 pub struct Options {
     port: Port,
+    max_peer_connections: usize,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Self { port: Port::Random }
+        Self {
+            port: Port::Port(6881),
+            max_peer_connections: 40,
+        }
     }
 }
 
@@ -149,7 +169,7 @@ pub(crate) async fn new<P: AsRef<Path>>(
     // TODO create file if it doesn't exist
 
     let mut peer_id_bytes = [0u8; 20];
-    rand::thread_rng().fill_bytes(&mut peer_id_bytes);
+    // rand::thread_rng().fill_bytes(&mut peer_id_bytes);
     let peer_id = PeerId(peer_id_bytes);
 
     let port = match options.port {
@@ -157,56 +177,69 @@ pub(crate) async fn new<P: AsRef<Path>>(
         Port::Random => rand::thread_rng().gen::<u16>(),
     };
 
+    let max_peer_connections = Arc::new(Semaphore::new(options.max_peer_connections));
+
     let torrent_handle = torrent_loop(
+        info_hash,
         metainfo,
         dot_torrent_path,
         data_path,
         number_of_pieces,
         peer_id,
         port,
+        max_peer_connections,
     )?;
 
     Ok((info_hash, torrent_handle))
 }
 
 fn torrent_loop(
+    info_hash: InfoHash,
     metainfo: MetaInfo,
     dot_torrent_path: PathBuf,
     data_path: PathBuf,
     number_of_pieces: usize,
     peer_id: PeerId,
     port: u16,
+    max_peer_connections: Arc<Semaphore>,
 ) -> Result<TorrentHandle, Error> {
-    let (tx, mut rx) = tokio::sync::mpsc::channel(20);
+    let (torrent_tx, mut torrent_rx) = tokio::sync::mpsc::channel(20);
 
     let rt = tokio::runtime::Handle::current();
+
+    let tx = torrent_tx.clone();
 
     let join_handle = rt.spawn(async move {
         let mut choke_timer = tokio::time::interval(std::time::Duration::from_secs(15));
         let mut announce_timer = tokio::time::interval(std::time::Duration::from_secs(300));
+        let mut peer_connect_timer = tokio::time::interval(std::time::Duration::from_secs(15));
 
         let left_bytes = metainfo.length();
 
         let mut state = State {
+            info_hash,
             metainfo,
             dot_torrent_path,
             data_path,
             http_client: reqwest::Client::new(),
             pieces: bitvec![u8, Msb0; 0; number_of_pieces],
-            connected_peers: BTreeMap::new(),
+            connected_peers: Vec::new(),
             available_peers: HashSet::new(),
+            max_peer_connections,
+            peer_stats: BTreeMap::new(),
             last_announce: None,
-            peer_id,
+            my_id: peer_id,
             port,
             left_bytes,
             uploaded_bytes: 0,
             downloaded_bytes: 0,
             state: TrackerState::Started,
+            torrent_tx,
         };
 
         loop {
             select! {
-                m = rx.recv() => {
+                m = torrent_rx.recv() => {
                     let m = m.unwrap();
                     match m {
                         Message::GetState { reply_tx } => {
@@ -216,7 +249,6 @@ fn torrent_loop(
                             match state.announce().await {
                                 Ok(response) => {
                                     state.handle_announce(&mut announce_timer, response.clone());
-                                    let _ = state.evaluate_and_connect_to_peers().await;
                                     let _ = reply_tx.send(Ok(response));
                                 }
                                 Err(e) => {
@@ -231,6 +263,10 @@ fn torrent_loop(
                             let _ = state.verify_local_data().await;
                         }
                     }
+                }
+                _ = peer_connect_timer.tick() => {
+                    debug!("peer connect timer");
+                    state.evaluate_and_connect_to_peers().await;
                 }
                 _ = announce_timer.tick() => {
                     match state.announce().await {
@@ -258,8 +294,61 @@ impl State {
     /// make some determination about what peers we should connect to,
     /// connect to those peers,
     /// disconnect from existing peers if necessary
-    async fn evaluate_and_connect_to_peers(&self) -> Result<(), Error> {
-        todo!()
+    async fn evaluate_and_connect_to_peers(&mut self) {
+        if self.max_peer_connections.available_permits() == 0 {
+            for _ in 0..3 {
+                let idx = rand::thread_rng().gen_range(0..self.connected_peers.len());
+
+                if let Some(peer) = self.connected_peers.get(idx) {
+                    peer.shutdown().await;
+                };
+
+                self.connected_peers.remove(idx);
+            }
+        }
+
+        // find peers in self.available_peers that are not in self.connected peers.
+        // maybe do this by set subtraction or something like that, based on ip address
+        // TODO
+        // let self.self.available_peers.
+        let available_ips = self
+            .available_peers
+            .iter()
+            .map(|peer| peer.ip)
+            .collect::<HashSet<IpAddr>>();
+
+        let connected_ips = self
+            .connected_peers
+            .iter()
+            .map(|peer| peer.ip)
+            .collect::<HashSet<IpAddr>>();
+
+        for ip in available_ips.difference(&connected_ips) {
+            debug!("ip: {}", ip);
+            if let Some(peer) = self.available_peers.iter().find(|peer| peer.ip == *ip) {
+                if let Some(peer_id) = peer.peer_id {
+                    if peer_id == self.my_id {
+                        continue;
+                    }
+                }
+
+                debug!("connecting to peer {}, {:?}", peer.ip, peer.peer_id);
+                if let Ok(peer_handle) = peer::new(
+                    peer.ip,
+                    peer.port,
+                    self.info_hash,
+                    self.my_id,
+                    self.pieces.clone(),
+                    peer.peer_id,
+                    self.torrent_tx.clone(),
+                    Arc::clone(&self.max_peer_connections),
+                )
+                .await
+                {
+                    self.connected_peers.push(peer_handle);
+                };
+            };
+        }
     }
 
     fn handle_announce(
@@ -273,9 +362,10 @@ impl State {
         }
 
         if let Some(interval) = response.get("interval") {
-            let interval = interval.as_str();
-            let interval: u64 = interval.parse().unwrap();
+            let interval = interval.as_u64();
             *announce_timer = tokio::time::interval(std::time::Duration::from_secs(interval));
+            // must do this or else it fires immediately
+            announce_timer.reset();
         }
 
         if let Some(peers) = response.get("peers") {
@@ -284,17 +374,36 @@ impl State {
                     debug!("got {} peers from tracker", l.len());
 
                     for peer in l {
-                        let peer_id =
-                            PeerId(peer.get("peer id").unwrap().as_bytes().try_into().unwrap());
-                        let ip = peer.get("ip").unwrap().as_str().to_string();
-                        let port = peer.get("port").unwrap().as_u16();
-                        let available_peer = AvailablePeer {
-                            peer_id: Some(peer_id),
-                            ip,
-                            port,
+                        let peer_id = if let Some(peer_id) = peer.get("peer id") {
+                            let peer_bytes = peer_id.as_bytes();
+                            if peer_bytes.is_empty() {
+                                None
+                            } else {
+                                let peer_bytes: [u8; 20] = peer_bytes.try_into().unwrap();
+                                let peer_id = PeerId(peer_bytes);
+                                Some(peer_id)
+                            }
+                        } else {
+                            None
                         };
 
-                        self.available_peers.insert(available_peer);
+                        let ip = peer.get("ip").unwrap().as_str();
+
+                        if let Ok(ip) = std::net::IpAddr::from_str(ip) {
+                            let port = peer.get("port").unwrap().as_u16();
+
+                            let available_peer = AvailablePeer { peer_id, ip, port };
+
+                            if let Some(peer_id) = available_peer.peer_id {
+                                if peer_id == self.my_id {
+                                    continue;
+                                }
+                            }
+
+                            self.available_peers.insert(available_peer);
+                        } else {
+                            continue;
+                        }
                     }
                 }
                 Bencode::ByteString(s) => todo!("process compact peers"),
@@ -323,7 +432,10 @@ impl State {
         let info_hash = &self.metainfo.info_hash()?.0;
         let info_hash = urlencoding::encode_binary(info_hash);
 
-        let peer_id = urlencoding::encode_binary(&self.peer_id.0);
+        // TODO
+        // something about how this is communicated over the wire is messed up
+        let peer_id = urlencoding::encode_binary(&self.my_id.0);
+        debug!("peer id in announce: {peer_id}");
 
         let event = self.state.to_string();
 
@@ -405,7 +517,7 @@ impl State {
 #[derive(Debug, Hash, PartialEq, Eq)]
 struct AvailablePeer {
     peer_id: Option<PeerId>,
-    ip: String,
+    ip: std::net::IpAddr,
     port: u16,
 }
 
