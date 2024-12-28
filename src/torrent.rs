@@ -1,7 +1,7 @@
 use crate::bencode::{self, Bencode};
 use crate::metainfo::MetaInfo;
 use crate::peer::{self, PeerHandle};
-use crate::{timeout, InfoHash};
+use crate::{timeout, InfoHash, METAINFOS};
 use base64::Engine;
 use bitvec::prelude::*;
 use bitvec::vec::BitVec;
@@ -50,6 +50,8 @@ pub enum Error {
     Announce(#[from] reqwest::Error),
     #[error("io")]
     Io(#[from] std::io::Error),
+    #[error("the metainfo no longer exists for some reasons")]
+    NoMetainfo,
 }
 
 pub(crate) enum Message {
@@ -62,6 +64,9 @@ pub(crate) enum Message {
     GetPieces {
         reply_tx: tokio::sync::oneshot::Sender<Result<Pieces, Error>>,
     },
+    PeerDisconnection {
+        peer_id: PeerId,
+    },
     VerifyLocalData,
 }
 
@@ -70,8 +75,6 @@ struct State {
     /// the channel to communicate to the runtime itself, if need be
     // rt_tx: tokio::sync::mpsc::Sender<runtime::Message>,
     info_hash: InfoHash,
-    /// the metainfo parsed from the .torrent file
-    metainfo: MetaInfo,
     /// location of the .torrent
     dot_torrent_path: PathBuf,
     /// download location
@@ -161,12 +164,21 @@ pub(crate) async fn new<P: AsRef<Path>>(
     let metainfo = MetaInfo::new(dot_torrent_decoded);
     let info_hash = metainfo.info_hash()?;
     let number_of_pieces = usize::try_from(metainfo.number_of_pieces()).unwrap();
+    // TODO actually calculate the number of bytes left
+    let left_bytes = metainfo.length();
+
+    // only take the write lock for this block
+    {
+        let mut metainfos = crate::METAINFOS.write().await;
+        metainfos.insert(info_hash, metainfo);
+    }
 
     let dot_torrent_path = dot_torrent_path.as_ref().to_path_buf();
     let data_path = data_path.as_ref().to_path_buf();
 
     // TODO create file if it doesn't exist
 
+    // TODO randomize this in release
     let mut peer_id_bytes = [0u8; 20];
     // rand::thread_rng().fill_bytes(&mut peer_id_bytes);
     let peer_id = PeerId(peer_id_bytes);
@@ -180,12 +192,12 @@ pub(crate) async fn new<P: AsRef<Path>>(
 
     let torrent_handle = torrent_loop(
         info_hash,
-        metainfo,
         dot_torrent_path,
         data_path,
         number_of_pieces,
         peer_id,
         port,
+        left_bytes,
         max_peer_connections,
     )?;
 
@@ -194,12 +206,12 @@ pub(crate) async fn new<P: AsRef<Path>>(
 
 fn torrent_loop(
     info_hash: InfoHash,
-    metainfo: MetaInfo,
     dot_torrent_path: PathBuf,
     data_path: PathBuf,
     number_of_pieces: usize,
     peer_id: PeerId,
     port: u16,
+    left_bytes: u64,
     max_peer_connections: Arc<Semaphore>,
 ) -> Result<TorrentHandle, Error> {
     let (torrent_tx, mut torrent_rx) = tokio::sync::mpsc::channel(20);
@@ -213,11 +225,8 @@ fn torrent_loop(
         let mut announce_timer = tokio::time::interval(std::time::Duration::from_secs(300));
         let mut peer_connect_timer = tokio::time::interval(std::time::Duration::from_secs(15));
 
-        let left_bytes = metainfo.length();
-
         let mut state = State {
             info_hash,
-            metainfo,
             dot_torrent_path,
             data_path,
             http_client: reqwest::Client::new(),
@@ -253,6 +262,15 @@ fn torrent_loop(
                                 Err(e) => {
                                     let _ = reply_tx.send(Err(e));
                                 }
+                            }
+                        }
+                        Message::PeerDisconnection { peer_id } => {
+                            let idx = state.connected_peers.iter().position(|peer| {
+                                peer.remote_peer_id == peer_id
+                            });
+                            if let Some(idx) = idx {
+                                let peer = state.connected_peers.remove(idx);
+                                debug!("removed peer {:?} due to disconnection", peer.remote_peer_id);
                             }
                         }
                         Message::GetPieces { reply_tx } => {
@@ -365,9 +383,12 @@ impl State {
             *announce_timer = tokio::time::interval(std::time::Duration::from_secs(interval));
             // must do this or else it fires immediately
             announce_timer.reset();
+            debug!("announcing again in {} seconds", interval);
         }
 
         if let Some(peers) = response.get("peers") {
+            let mut available_peers = HashSet::new();
+
             match peers {
                 Bencode::List(l) => {
                     debug!("got {} peers from tracker", l.len());
@@ -399,11 +420,15 @@ impl State {
                                 }
                             }
 
-                            self.available_peers.insert(available_peer);
+                            available_peers.insert(available_peer);
                         } else {
                             continue;
                         }
                     }
+
+                    debug!("got {} available peers on announce", available_peers.len());
+
+                    self.available_peers = available_peers;
                 }
                 Bencode::ByteString(s) => todo!("process compact peers"),
                 _ => panic!("TODO, bad peers response from tracker"),
@@ -428,8 +453,7 @@ impl State {
         let mut buf = itoa::Buffer::new();
         let downloaded = buf.format(self.downloaded_bytes);
 
-        let info_hash = &self.metainfo.info_hash()?.0;
-        let info_hash = urlencoding::encode_binary(info_hash);
+        let urlencoded_info_hash = urlencoding::encode_binary(&self.info_hash.0);
 
         // TODO
         // something about how this is communicated over the wire is messed up
@@ -439,7 +463,7 @@ impl State {
         let event = self.state.to_string();
 
         let query_params = &[
-            ("info_hash", info_hash),
+            ("info_hash", urlencoded_info_hash),
             ("peer_id", peer_id),
             ("port", Cow::Borrowed(port)),
             ("left", Cow::Borrowed(left)),
@@ -451,7 +475,15 @@ impl State {
         // indescribably stupid that this is necessary because of
         // https://github.com/servo/rust-url/issues/219
         // and https://github.com/nox/serde_urlencoded/issues/44
-        let mut announce_url = self.metainfo.announce().to_string();
+        let mut announce_url = {
+            let metainfos = METAINFOS.read().await;
+            if let Some(metainfo) = metainfos.get(&self.info_hash) {
+                metainfo.announce().to_string()
+            } else {
+                return Err(Error::NoMetainfo);
+            }
+        };
+
         announce_url.push('?');
         for (key, value) in query_params {
             announce_url.push_str(key);
@@ -474,12 +506,33 @@ impl State {
     }
 
     async fn verify_local_data(&mut self) -> Result<(), Error> {
-        let piece_length = usize::try_from(self.metainfo.piece_length()).unwrap();
+        let piece_length = {
+            if let Some(metainfo) = METAINFOS.read().await.get(&self.info_hash) {
+                usize::try_from(metainfo.piece_length()).unwrap()
+            } else {
+                return Err(Error::NoMetainfo);
+            }
+        };
+
         let mut f = tokio::fs::File::open(&self.data_path).await?;
         // TODO parallelize
 
-        let length = self.metainfo.length();
-        let number_of_pieces = usize::try_from(self.metainfo.number_of_pieces()).unwrap();
+        let length = {
+            if let Some(metainfo) = METAINFOS.read().await.get(&self.info_hash) {
+                metainfo.length()
+            } else {
+                return Err(Error::NoMetainfo);
+            }
+        };
+
+        let number_of_pieces = {
+            if let Some(metainfo) = METAINFOS.read().await.get(&self.info_hash) {
+                usize::try_from(metainfo.number_of_pieces()).unwrap()
+            } else {
+                return Err(Error::NoMetainfo);
+            }
+        };
+
         let nominal_length = number_of_pieces * piece_length;
 
         let left_over = nominal_length - usize::try_from(length).unwrap();
@@ -488,28 +541,34 @@ impl State {
         let mut normal_piece_buf = vec![0u8; piece_length];
         let mut last_piece_buf = vec![0u8; last_piece_length];
 
-        for (i, piece_hash) in self.metainfo.piece_hashes_iter().enumerate() {
-            f.seek(std::io::SeekFrom::Start(
-                u64::try_from(piece_length * i).unwrap(),
-            ))
-            .await?;
+        if let Some(metainfo) = METAINFOS.read().await.get(&self.info_hash) {
+            let piece_hashes = metainfo.piece_hashes_iter();
 
-            let have_piece = if i == number_of_pieces - 1 {
-                f.read_exact(&mut last_piece_buf).await?;
-                &crate::hash(&last_piece_buf) == piece_hash
-            } else {
-                f.read_exact(&mut normal_piece_buf).await?;
-                &crate::hash(&normal_piece_buf) == piece_hash
-            };
+            for (i, piece_hash) in piece_hashes.enumerate() {
+                f.seek(std::io::SeekFrom::Start(
+                    u64::try_from(piece_length * i).unwrap(),
+                ))
+                .await?;
 
-            if have_piece {
-                self.pieces.set(i, true);
-            } else {
-                self.pieces.set(i, false);
+                let have_piece = if i == number_of_pieces - 1 {
+                    f.read_exact(&mut last_piece_buf).await?;
+                    &crate::hash(&last_piece_buf) == piece_hash
+                } else {
+                    f.read_exact(&mut normal_piece_buf).await?;
+                    &crate::hash(&normal_piece_buf) == piece_hash
+                };
+
+                if have_piece {
+                    self.pieces.set(i, true);
+                } else {
+                    self.pieces.set(i, false);
+                }
             }
-        }
 
-        Ok(())
+            Ok(())
+        } else {
+            Err(Error::NoMetainfo)
+        }
     }
 }
 

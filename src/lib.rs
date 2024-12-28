@@ -1,9 +1,10 @@
 use base64::Engine;
 use bencode::Bencode;
+use metainfo::MetaInfo;
 use std::fmt::Debug;
 use std::{collections::BTreeMap, path::Path};
 use thiserror::Error;
-use tokio::sync::Semaphore;
+use tokio::sync::{RwLock, Semaphore};
 use torrent::{Pieces, TorrentHandle};
 
 mod bencode;
@@ -30,8 +31,11 @@ pub enum Error {
 
 // is this a good idea? bad idea?
 // should we have an object that holds this data instead of it being a static? idk
-static TORRENTS: tokio::sync::RwLock<BTreeMap<InfoHash, TorrentHandle>> =
-    tokio::sync::RwLock::const_new(BTreeMap::new());
+static TORRENTS: RwLock<BTreeMap<InfoHash, TorrentHandle>> = RwLock::const_new(BTreeMap::new());
+// this is immutable.
+// once a metainfo is inserted, it is never modified, unless it is deleted
+// due to a torrent being removed
+static METAINFOS: RwLock<BTreeMap<InfoHash, MetaInfo>> = RwLock::const_new(BTreeMap::new());
 
 // todo do this by config
 static GLOBAL_MAX_CONNECTIONS: tokio::sync::Semaphore = Semaphore::const_new(200);

@@ -29,7 +29,7 @@ impl Debug for Bencode {
 
             Bencode::ByteString(v) => match std::str::from_utf8(v) {
                 Ok(s) => write!(f, "String({})", s),
-                Err(e) => write!(f, "ByteString({:?})", v),
+                Err(_e) => write!(f, "ByteString({:?})", v),
             },
         }
     }

@@ -21,24 +21,46 @@ pub(super) enum Error {
 const ONE_MB: usize = 1048576;
 const FRAME_RECEIVE_MAX: usize = 8 * ONE_MB;
 
-pub(super) struct HandshakeProtocol {
-    info_hash: InfoHash,
-    remote_peer_id: Option<PeerId>,
+#[derive(Debug)]
+#[cfg_attr(test, derive(PartialEq))]
+pub(super) struct HandshakeFrame {
+    pub info_hash: InfoHash,
+    pub peer_id: PeerId,
+    /// todo make these real named fields at some point
+    pub protocol_features: [u8; 8],
 }
 
-impl HandshakeProtocol {
-    pub(super) fn new(info_hash: InfoHash, remote_peer_id: Option<PeerId>) -> Self {
+impl HandshakeFrame {
+    pub(super) fn new(info_hash: InfoHash, peer_id: PeerId, protocol_features: [u8; 8]) -> Self {
         Self {
             info_hash,
-            remote_peer_id,
+            peer_id,
+            protocol_features,
         }
     }
+}
 
-    const HANDSHAKE_LENGTH: usize = 1 + 19 + 8 + 20 + 20;
+pub(super) struct HandshakeProtocol {}
+
+impl HandshakeProtocol {
+    pub(super) fn new() -> Self {
+        Self {}
+    }
+
+    const PROTOCOL_LENGTH_LENGTH: usize = 1;
+    const PROTOCOL_LENGTH: usize = 19;
+    const PROTOCOL_FEATURE_BYTES_LENGTH: usize = 8;
+    const INFO_HASH_LENGTH: usize = 20;
+    const PEER_ID_LENGTH: usize = 20;
+    const HANDSHAKE_LENGTH: usize = Self::PROTOCOL_LENGTH_LENGTH
+        + Self::PROTOCOL_LENGTH
+        + Self::PROTOCOL_FEATURE_BYTES_LENGTH
+        + Self::INFO_HASH_LENGTH
+        + Self::PEER_ID_LENGTH;
 }
 
 impl Decoder for HandshakeProtocol {
-    type Item = PeerId;
+    type Item = HandshakeFrame;
 
     type Error = std::io::Error;
 
@@ -56,52 +78,68 @@ impl Decoder for HandshakeProtocol {
         }
 
         let len_byte = src.get_u8();
-        if len_byte != 19 {
+        if len_byte != Self::PROTOCOL_LENGTH as u8 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "first byte not 19",
             ));
         }
 
-        if &src[..19] != b"BitTorrent protocol" {
+        if &src[..Self::PROTOCOL_LENGTH] != b"BitTorrent protocol" {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "Not 'BitTorrent protocol'",
             ));
         }
 
-        src.advance(19);
+        src.advance(Self::PROTOCOL_LENGTH);
 
-        // ignore protocol options
-        src.advance(8);
+        // ignore protocol options for now
+        // TODO actually parse these
+        let mut protocol_features = [0; 8];
+        protocol_features.copy_from_slice(&src[..8]);
 
-        if &src[..20] != &self.info_hash.0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "Bad info hash",
-            ));
-        }
+        src.advance(Self::PROTOCOL_FEATURE_BYTES_LENGTH);
 
-        src.advance(20);
+        let mut info_hash = [0; 20];
 
-        let challenge_peer_id = &src[..20];
-        let challenge_peer_id: [u8; 20] = challenge_peer_id.try_into().unwrap();
-        let challenge_peer_id = PeerId(challenge_peer_id);
+        info_hash.copy_from_slice(&src[..Self::INFO_HASH_LENGTH]);
 
-        // if there is a peer id, we compare it.
-        // if not, the tracker is using compact peers,
-        // so we don't yet have a peer id until the peer sends it to us,
-        // so we can't compare it with something the tracker never gave us.
-        if let Some(remote_peer_id) = self.remote_peer_id {
-            if challenge_peer_id != remote_peer_id {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "Bad info peer id",
-                ));
-            }
-        }
+        let info_hash = InfoHash(info_hash);
 
-        Ok(Some(challenge_peer_id))
+        // if src[..Self::INFO_HASH_LENGTH] != self.info_hash.0 {
+        //     return Err(std::io::Error::new(
+        //         std::io::ErrorKind::InvalidData,
+        //         "Bad info hash",
+        //     ));
+        // }
+
+        src.advance(Self::INFO_HASH_LENGTH);
+
+        let peer_id = &src[..Self::PEER_ID_LENGTH];
+        let peer_id: [u8; Self::PEER_ID_LENGTH] = peer_id.try_into().unwrap();
+        let peer_id = PeerId(peer_id);
+
+        Ok(Some(HandshakeFrame {
+            info_hash,
+            peer_id,
+            protocol_features,
+        }))
+    }
+}
+
+impl Encoder<HandshakeFrame> for HandshakeProtocol {
+    type Error = std::io::Error;
+
+    fn encode(&mut self, item: HandshakeFrame, dst: &mut BytesMut) -> Result<(), Self::Error> {
+        dst.reserve(Self::HANDSHAKE_LENGTH);
+        dst.put_u8(Self::PROTOCOL_LENGTH as u8);
+        dst.extend_from_slice(b"BitTorrent protocol");
+        dst.extend_from_slice(&item.protocol_features);
+        dst.extend_from_slice(&item.info_hash.0);
+        dst.extend_from_slice(&item.peer_id.0);
+
+        Ok(())
     }
 }
 
@@ -402,14 +440,46 @@ pub(super) enum Frame {
 
 #[cfg(test)]
 mod tests {
+    use super::{Frame, HandshakeFrame, HandshakeProtocol, PeerProtocol};
+    use crate::peer::PeerId;
+    use crate::torrent::Pieces;
+    use crate::InfoHash;
     use futures::SinkExt;
     use rand::{thread_rng, Rng};
     use tokio_stream::StreamExt;
     use tokio_util::codec::{FramedRead, FramedWrite};
 
-    use crate::torrent::Pieces;
+    #[tokio::test]
+    async fn roundtrips_handshake() {
+        let buf = vec![];
+        let mut writer = FramedWrite::new(buf, HandshakeProtocol::new());
 
-    use super::{Frame, PeerProtocol};
+        let mut rng = thread_rng();
+
+        let mut info_hash: [u8; 20] = [0; 20];
+        rng.fill(&mut info_hash[..]);
+        let info_hash = InfoHash(info_hash);
+
+        let mut peer_id: [u8; 20] = [0; 20];
+        rng.fill(&mut peer_id[..]);
+        let peer_id = PeerId(peer_id);
+
+        let mut protocol_features: [u8; 8] = [0; 8];
+        rng.fill(&mut protocol_features[..]);
+
+        writer
+            .send(HandshakeFrame::new(info_hash, peer_id, protocol_features))
+            .await
+            .unwrap();
+        let out = writer.get_ref();
+
+        let mut reader = FramedRead::new(&out[..], HandshakeProtocol::new());
+
+        assert_eq!(
+            reader.next().await.unwrap().unwrap(),
+            HandshakeFrame::new(info_hash, peer_id, protocol_features)
+        );
+    }
 
     #[tokio::test]
     async fn roundtrips_keepalive() {

@@ -2,22 +2,21 @@ use crate::torrent::{self, PeerId, Pieces};
 use crate::{timeout, InfoHash};
 use bitvec::{bitvec, order::Msb0};
 use futures::sink::SinkExt;
-use protocol::{Frame, PeerProtocol};
+use protocol::{Frame, HandshakeFrame, PeerProtocol};
 use std::net::IpAddr;
 use std::sync::Arc;
+use std::time::Duration;
 use thiserror::Error;
-use tokio::io::AsyncWriteExt;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, TryAcquireError};
+use tokio::time::interval;
 use tokio::{select, task::JoinHandle, time::error::Elapsed};
 use tokio_stream::StreamExt;
 use tokio_util::codec::{FramedRead, FramedWrite};
 use tracing::{debug, instrument};
 
 mod protocol;
-
-const TWO_MINUTES: u64 = 2 * 60;
 
 #[derive(Debug, Error)]
 pub(crate) enum Error {
@@ -41,13 +40,17 @@ pub enum TorrentToPeer {
     Shutdown,
 }
 
+// TODO implement Debug manually for this, since it contains undebuggable fields
 struct State {
     /// me
     my_id: PeerId,
     /// send messages to the owning torrent
     torrent_tx: mpsc::Sender<torrent::Message>,
+    /// send data to the remote peer
+    writer: FramedWrite<OwnedWriteHalf, PeerProtocol>,
     /// the pieces the remote peer has
     peer_pieces: Pieces,
+    /// the pieces we have
     my_pieces: Pieces,
     i_am_choking_peer: bool,
     i_am_interested_in_peer: bool,
@@ -55,7 +58,7 @@ struct State {
     peer_is_interested_in_me: bool,
 }
 
-#[instrument]
+#[instrument(skip_all)]
 pub(crate) async fn new(
     ip: IpAddr,
     port: u16,
@@ -75,8 +78,7 @@ pub(crate) async fn new(
     let mut socket = tokio::net::TcpStream::connect((ip, port)).await?;
     debug!("connected");
 
-    let actual_remote_peer_id =
-        handshake_peer(&mut socket, info_hash, my_id, remote_peer_id).await?;
+    let handshake_frame = handshake_peer(&mut socket, info_hash, my_id, remote_peer_id).await?;
     debug!("handshook peer");
 
     let (socket_rx, socket_tx) = socket.into_split();
@@ -87,7 +89,7 @@ pub(crate) async fn new(
     let peer_handle = peer_loop(
         info_hash,
         my_id,
-        actual_remote_peer_id,
+        handshake_frame.peer_id,
         reader,
         writer,
         ip,
@@ -105,6 +107,7 @@ pub(crate) async fn accept_peer_connection(socket: TcpStream) -> Result<PeerHand
 }
 
 /// the peer's main processing loop
+#[instrument(skip_all)]
 fn peer_loop(
     info_hash: InfoHash,
     my_id: PeerId,
@@ -139,16 +142,20 @@ fn peer_loop(
                     timeout!(writer.send(Frame::Bitfield { pieces: my_pieces }), 5).await??;
                     debug!("sent bitfield")
                 } else {
-                    return Ok(())
+                    return Ok(());
                 };
             } else {
                 return Ok(());
             }
         };
 
+        let mut timeout_timer = interval(Duration::from_secs(30));
+        timeout_timer.reset();
+
         let mut state = State {
             my_id,
             torrent_tx,
+            writer,
             peer_pieces: bitvec![u8, Msb0; 0; my_pieces.len()],
             my_pieces,
             i_am_choking_peer: true,
@@ -164,40 +171,53 @@ fn peer_loop(
                         Some(Ok(frame)) => {
                             match frame {
                                 protocol::Frame::Keepalive => (),
-                                protocol::Frame::Choke => state.peer_is_choking_me = true,
-                                protocol::Frame::Unchoke => state.peer_is_choking_me = false,
-                                protocol::Frame::Interested => state.peer_is_interested_in_me = true,
-                                protocol::Frame::NotInterested => state.peer_is_interested_in_me = false,
+                                protocol::Frame::Choke => {
+                                    debug!("received choke");
+                                    handle_choke(&mut state).await?;
+                                },
+                                protocol::Frame::Unchoke => {
+                                    debug!("received unchoke");
+                                    handle_unchoke(&mut state).await?;
+                                },
+                                protocol::Frame::Interested => {
+                                    debug!("received interested");
+                                    handle_interested(&mut state).await?;
+                                },
+                                protocol::Frame::NotInterested => {
+                                    debug!("received not interested");
+                                    handle_not_interested(&mut state).await?;
+                                },
                                 protocol::Frame::Have { index } => {
-                                    state.peer_pieces.set(index.try_into().unwrap(), true)
+                                    debug!("received have");
+                                    handle_have(&mut state, index).await?;
                                 },
                                 protocol::Frame::Bitfield { pieces } => {
                                     debug!("received bitfield");
-
-                                    state.peer_pieces = pieces;
-
-                                    if right_but_not_left(&state.my_pieces, &state.peer_pieces).any() {
-                                        debug!("i am interested because of bitfield");
-                                        state.i_am_interested_in_peer = true;
-                                    }
-
-                                    if state.i_am_interested_in_peer {
-                                        // TODO
-                                        // figure out what pieces to download
-                                        // https://docs.rs/bitvec/1.0.1/bitvec/vec/struct.BitVec.html#method.iter_ones
-                                    }
+                                    handle_bitfield(&mut state, pieces).await?;
                                 },
                                 protocol::Frame::Request { index, begin, length } => {
+                                    debug!("received request");
                                     handle_request(&state, index, begin, length).await?;
                                 },
                                 protocol::Frame::Piece { index, begin, block } => {
+                                    debug!("received piece");
                                     handle_piece(&state, index, begin, &block).await?;
                                 },
-                                protocol::Frame::Cancel { index, begin, length } => handle_cancel(&state, index, begin, length).await?,
+                                protocol::Frame::Cancel { index, begin, length } => {
+                                    debug!("received cancel");
+                                    handle_cancel(&state, index, begin, length).await?
+                                },
                             }
                         }
-                        Some(Err(e)) => return Err(e.into()),
-                        None => break
+                        Some(Err(e)) => {
+                            debug!("got error reading from remote peer: {e}");
+                            return Err(e.into())
+                        },
+                        None => {
+                            debug!("got None reading from remote peer {:?}, disconnecting.", remote_peer_id);
+                            let _ = state.torrent_tx.send(torrent::Message::PeerDisconnection { peer_id: remote_peer_id }).await;
+                            break
+                        }
                     }
                 }
                 m = peer_rx.recv() => {
@@ -212,6 +232,9 @@ fn peer_loop(
                             }
                         }
                     }
+                }
+                _ = timeout_timer.tick() => {
+                    state.writer.send(Frame::Keepalive).await?;
                 }
             }
         }
@@ -228,63 +251,119 @@ fn peer_loop(
 }
 ///  determine what pieces are in right that are not in left
 fn right_but_not_left(left: &Pieces, right: &Pieces) -> Pieces {
+    // NOTing left gives us the pieces left doesn't have.
+    // ANDing those with right gives us the pieces that right has,
+    // that left doesn't have.
     right.clone() & !left.clone()
 }
 
+#[instrument(skip_all)]
+async fn handle_choke(state: &mut State) -> Result<(), Error> {
+    state.peer_is_choking_me = true;
+    // TODO cancel any queued requests
+    Ok(())
+}
+
+#[instrument(skip_all)]
+async fn handle_unchoke(state: &mut State) -> Result<(), Error> {
+    state.peer_is_choking_me = false;
+    // TODO
+    // figure out what pieces to download
+    // https://docs.rs/bitvec/1.0.1/bitvec/vec/struct.BitVec.html#method.iter_ones
+    Ok(())
+}
+
+#[instrument(skip_all)]
+async fn handle_interested(state: &mut State) -> Result<(), Error> {
+    state.peer_is_interested_in_me = true;
+    Ok(())
+}
+
+#[instrument(skip_all)]
+async fn handle_not_interested(state: &mut State) -> Result<(), Error> {
+    state.peer_is_interested_in_me = false;
+    Ok(())
+}
+
+#[instrument(skip_all)]
+async fn handle_have(state: &mut State, index: u32) -> Result<(), Error> {
+    state.peer_pieces.set(index.try_into().unwrap(), true);
+    Ok(())
+}
+
+#[instrument(skip_all)]
+async fn handle_bitfield(state: &mut State, peer_pieces: Pieces) -> Result<(), Error> {
+    state.peer_pieces = peer_pieces;
+
+    if right_but_not_left(&state.my_pieces, &state.peer_pieces).any() {
+        debug!("i am interested because of bitfield");
+        state.i_am_interested_in_peer = true;
+        timeout!(state.writer.send(Frame::Interested), 5).await??;
+    }
+
+    Ok(())
+}
+
+#[instrument(skip(state))]
 async fn handle_request(state: &State, index: u32, begin: u32, length: u32) -> Result<(), Error> {
     todo!()
 }
 
+#[instrument(skip(state))]
 async fn handle_piece(state: &State, index: u32, begin: u32, block: &[u8]) -> Result<(), Error> {
     todo!()
 }
 
+#[instrument(skip(state))]
 async fn handle_cancel(state: &State, index: u32, begin: u32, length: u32) -> Result<(), Error> {
     todo!()
 }
 
 // TODO have this use its own codec
-#[instrument]
+#[instrument(skip(socket))]
 async fn handshake_peer(
     socket: &mut tokio::net::TcpStream,
     info_hash: InfoHash,
     my_id: PeerId,
     remote_peer_id: Option<PeerId>,
-) -> Result<PeerId, Error> {
-    timeout!(send_handshake(socket, info_hash, my_id), 5).await??;
+) -> Result<HandshakeFrame, Error> {
+    let (rx, tx) = socket.split();
 
-    let mut reader = FramedRead::new(
-        socket,
-        protocol::HandshakeProtocol::new(info_hash, remote_peer_id),
-    );
+    let mut reader = FramedRead::new(rx, protocol::HandshakeProtocol::new());
+
+    let mut writer = FramedWrite::new(tx, protocol::HandshakeProtocol::new());
+
+    timeout!(
+        writer.send(HandshakeFrame::new(info_hash, my_id, [0; 8])),
+        15
+    )
+    .await??;
+    debug!("sent handshake");
 
     // TODO do not unwrap here
-    let peer_id = timeout!(reader.next(), 15).await?.unwrap()?;
-    debug!("handshake good");
+    let handshake_frame = timeout!(reader.next(), 15).await?.unwrap()?;
 
-    Ok(peer_id)
-}
+    if handshake_frame.info_hash != info_hash {
+        return Err(Error::Handshake("info hash did not match"));
+    }
 
-// TODO do this as a codec
-async fn send_handshake(
-    socket: &mut tokio::net::TcpStream,
-    info_hash: InfoHash,
-    my_id: PeerId,
-) -> Result<(), Error> {
-    socket.write_u8(19).await?;
-    socket.write_all(b"BitTorrent protocol").await?;
-    socket.write_all(&[0, 0, 0, 0, 0, 0, 0, 0]).await?;
-    socket.write_all(&info_hash.0).await?;
-    socket.write_all(&my_id.0).await?;
-    socket.flush().await?;
-    debug!("sent handshake");
-    Ok(())
+    if let Some(remote_peer_id) = remote_peer_id {
+        if handshake_frame.peer_id != remote_peer_id {
+            return Err(Error::Handshake("remote peer id did not match"));
+        }
+    }
+
+    debug!("received handshake");
+
+    debug!("handshake is good");
+
+    Ok(handshake_frame)
 }
 
 #[derive(Debug)]
 pub(crate) struct PeerHandle {
     /// the id of the remote peer
-    remote_peer_id: PeerId,
+    pub remote_peer_id: PeerId,
     pub ip: IpAddr,
     /// this is the channel by which we get messages to the peer
     peer_tx: mpsc::Sender<TorrentToPeer>,
@@ -293,6 +372,7 @@ pub(crate) struct PeerHandle {
 }
 
 impl PeerHandle {
+    #[instrument]
     pub(crate) async fn shutdown(&self) {
         if let Err(_elapsed) = timeout!(self.peer_tx.send(TorrentToPeer::Shutdown), 5).await {
             self.task_handle.abort();
