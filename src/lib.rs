@@ -1,3 +1,11 @@
+// TODO
+// - [ ] figure out peer/torrent linkage for error handling.
+//       there is a lot of uncertainty here. we need to be able to
+//       propagate this failure information so tasks shut down properly.
+//       could probably use https://docs.rs/tokio/latest/tokio/sync/index.html#watch-channel
+// - [ ] accept incoming connections
+// - [ ] have peer tasks send stats...somewhere. we want to be able to use them in the choking algorithm
+
 use base64::Engine;
 use bencode::Bencode;
 use metainfo::MetaInfo;
@@ -8,6 +16,7 @@ use tokio::sync::{RwLock, Semaphore};
 use torrent::{Pieces, TorrentHandle};
 
 mod bencode;
+mod download;
 mod metainfo;
 mod peer;
 pub mod torrent;
@@ -27,6 +36,8 @@ impl Debug for InfoHash {
 pub enum Error {
     #[error("torrent error")]
     Torrent(#[from] torrent::Error),
+    #[error("unable to get pieces for this torrent")]
+    NoPieces,
 }
 
 // is this a good idea? bad idea?
@@ -36,6 +47,8 @@ static TORRENTS: RwLock<BTreeMap<InfoHash, TorrentHandle>> = RwLock::const_new(B
 // once a metainfo is inserted, it is never modified, unless it is deleted
 // due to a torrent being removed
 static METAINFOS: RwLock<BTreeMap<InfoHash, MetaInfo>> = RwLock::const_new(BTreeMap::new());
+
+static PIECES: RwLock<BTreeMap<InfoHash, Pieces>> = RwLock::const_new(BTreeMap::new());
 
 // todo do this by config
 static GLOBAL_MAX_CONNECTIONS: tokio::sync::Semaphore = Semaphore::const_new(200);
@@ -75,13 +88,9 @@ pub async fn force_announce(info_hash: InfoHash) -> Result<Bencode, Error> {
 }
 
 pub async fn get_pieces(info_hash: InfoHash) -> Result<Pieces, Error> {
-    let torrents = TORRENTS.read().await;
-    if let Some(torrent) = torrents.get(&info_hash) {
-        let pieces = torrent.get_pieces().await?;
-        Ok(pieces)
-    } else {
-        panic!()
-    }
+    let pieces = PIECES.read().await;
+    let my_pieces = pieces.get(&info_hash).ok_or(Error::NoPieces)?;
+    Ok(my_pieces.to_owned())
 }
 
 pub async fn get_state(info_hash: InfoHash) -> Result<String, Error> {

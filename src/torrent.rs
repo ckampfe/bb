@@ -1,7 +1,7 @@
 use crate::bencode::{self, Bencode};
 use crate::metainfo::MetaInfo;
 use crate::peer::{self, PeerHandle};
-use crate::{timeout, InfoHash, METAINFOS};
+use crate::{timeout, InfoHash, METAINFOS, PIECES};
 use base64::Engine;
 use bitvec::prelude::*;
 use bitvec::vec::BitVec;
@@ -15,9 +15,10 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
 use thiserror::Error;
+use tokio::fs::OpenOptions;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio::select;
-use tokio::sync::{mpsc, Semaphore};
+use tokio::sync::{broadcast, mpsc, Semaphore};
 use tokio::time::Interval;
 use tracing::debug;
 
@@ -52,6 +53,8 @@ pub enum Error {
     Io(#[from] std::io::Error),
     #[error("the metainfo no longer exists for some reasons")]
     NoMetainfo,
+    #[error("unable to get pieces for this torrent")]
+    NoPieces,
 }
 
 pub(crate) enum Message {
@@ -61,13 +64,13 @@ pub(crate) enum Message {
     Announce {
         reply_tx: tokio::sync::oneshot::Sender<Result<Bencode, Error>>,
     },
-    GetPieces {
-        reply_tx: tokio::sync::oneshot::Sender<Result<Pieces, Error>>,
-    },
     PeerDisconnection {
         peer_id: PeerId,
     },
     VerifyLocalData,
+    GetDataLocation {
+        reply_tx: tokio::sync::oneshot::Sender<Result<PathBuf, Error>>,
+    },
 }
 
 #[derive(Debug)]
@@ -81,8 +84,6 @@ struct State {
     data_path: PathBuf,
     /// for tracker announce/scrape/etc
     http_client: reqwest::Client,
-    /// the pieces of the torrent that we have
-    pieces: Pieces,
     /// peer's we're connected to
     connected_peers: Vec<PeerHandle>,
     /// peers, as we get them from the tracker
@@ -102,9 +103,27 @@ struct State {
     // ("downloaded", self.downloaded),
     downloaded_bytes: u64,
     // ("event", self.state),
-    state: TrackerState,
+    state: TorrentState,
+    tracker_state: TrackerState,
     max_peer_connections: Arc<Semaphore>,
     torrent_tx: mpsc::Sender<Message>,
+    p2p_tx: broadcast::Sender<P2PMessage>,
+}
+
+#[derive(Debug)]
+enum TorrentState {
+    Seeding,
+    Leaching,
+}
+
+/// used in 2 scenarios:
+/// - torrent to send message to all peers
+/// - peer to send message to all other peers
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum P2PMessage {
+    /// peers broadcast this message to let the other peers in the cluster know
+    /// that they have a message
+    Have { index: u32 },
 }
 
 /// stats for a single peer
@@ -162,12 +181,14 @@ pub(crate) async fn new<P: AsRef<Path>>(
         .map_err(|e| Error::DotTorrentRead(e.to_string()))?;
     let dot_torrent_decoded = bencode::decode(&dot_torrent_data).unwrap();
     let metainfo = MetaInfo::new(dot_torrent_decoded);
+    let len = metainfo.length();
+    let mut full_file_path = data_path.as_ref().to_owned();
+    full_file_path.push(metainfo.name());
     let info_hash = metainfo.info_hash()?;
     let number_of_pieces = usize::try_from(metainfo.number_of_pieces()).unwrap();
     // TODO actually calculate the number of bytes left
     let left_bytes = metainfo.length();
 
-    // only take the write lock for this block
     {
         let mut metainfos = crate::METAINFOS.write().await;
         metainfos.insert(info_hash, metainfo);
@@ -177,6 +198,14 @@ pub(crate) async fn new<P: AsRef<Path>>(
     let data_path = data_path.as_ref().to_path_buf();
 
     // TODO create file if it doesn't exist
+    let f = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(full_file_path)
+        .await?;
+
+    f.set_len(len).await?;
 
     // TODO randomize this in release
     let mut peer_id_bytes = [0u8; 20];
@@ -214,23 +243,30 @@ fn torrent_loop(
     left_bytes: u64,
     max_peer_connections: Arc<Semaphore>,
 ) -> Result<TorrentHandle, Error> {
-    let (torrent_tx, mut torrent_rx) = tokio::sync::mpsc::channel(20);
+    let (torrent_tx, mut torrent_rx) = mpsc::channel(20);
 
     let rt = tokio::runtime::Handle::current();
 
     let tx = torrent_tx.clone();
+
+    let (p2p_tx, mut p2p_rx) = broadcast::channel(20);
 
     let join_handle = rt.spawn(async move {
         let mut choke_timer = tokio::time::interval(std::time::Duration::from_secs(15));
         let mut announce_timer = tokio::time::interval(std::time::Duration::from_secs(300));
         let mut peer_connect_timer = tokio::time::interval(std::time::Duration::from_secs(15));
 
+        {
+            let mut pieces = PIECES.write().await;
+            pieces.insert(info_hash, bitvec![u8, Msb0; 0; number_of_pieces]);
+        }
+
+
         let mut state = State {
             info_hash,
             dot_torrent_path,
             data_path,
             http_client: reqwest::Client::new(),
-            pieces: bitvec![u8, Msb0; 0; number_of_pieces],
             connected_peers: Vec::new(),
             available_peers: HashSet::new(),
             max_peer_connections,
@@ -241,12 +277,33 @@ fn torrent_loop(
             left_bytes,
             uploaded_bytes: 0,
             downloaded_bytes: 0,
-            state: TrackerState::Started,
+            state: TorrentState::Leaching,
+            tracker_state: TrackerState::Started,
             torrent_tx,
+            p2p_tx,
         };
 
         loop {
             select! {
+                Ok(m) = p2p_rx.recv() => {
+                    match m {
+                        // every time a peer reports that we now have a new piece,
+                        // check if we are done
+                        P2PMessage::Have { .. } => {
+                            let pieces = PIECES.read().await;
+
+                            let my_pieces = pieces.get(&info_hash).ok_or(Error::NoPieces)?;
+
+                            if my_pieces.all() {
+                                // we are done!
+                                state.state = TorrentState::Seeding;
+                                state.tracker_state = TrackerState::Completed;
+
+                                state.announce().await?;
+                            }
+                        },
+                    }
+                }
                 m = torrent_rx.recv() => {
                     let m = m.unwrap();
                     match m {
@@ -264,6 +321,19 @@ fn torrent_loop(
                                 }
                             }
                         }
+                        // TODO get rid of this in favor of a global PIECES
+                        // infohash->pieces map,
+                        // to save memory so we're not just copying around a ton of
+                        // pieces bitsets to dozens or potential hundreds of peer tasks,
+                        // and having to keep them in sync.
+                        // just have one, and keep it in sync, since it's "global" to that
+                        // particular torrent anyway
+                        // Message::Have { index } => {
+                        //     // state.pieces.set(index as usize, true);
+                        //     if let Some(pieces) = PIECES.write().get(state.info_hash) {
+                        //         todo!()
+                        //     }
+                        // }
                         Message::PeerDisconnection { peer_id } => {
                             let idx = state.connected_peers.iter().position(|peer| {
                                 peer.remote_peer_id == peer_id
@@ -273,11 +343,11 @@ fn torrent_loop(
                                 debug!("removed peer {:?} due to disconnection", peer.remote_peer_id);
                             }
                         }
-                        Message::GetPieces { reply_tx } => {
-                            let _ = reply_tx.send(Ok(state.pieces.clone()));
-                        }
                         Message::VerifyLocalData => {
                             let _ = state.verify_local_data().await;
+                        }
+                        Message::GetDataLocation { reply_tx } => {
+                            let _ = reply_tx.send(Ok(state.data_path.clone()));
                         }
                     }
                 }
@@ -300,6 +370,8 @@ fn torrent_loop(
                 }
             }
         }
+
+        Ok(())
     });
 
     Ok(TorrentHandle { tx, join_handle })
@@ -351,11 +423,14 @@ impl State {
 
                 debug!("connecting to peer {}, {:?}", peer.ip, peer.peer_id);
                 if let Ok(peer_handle) = peer::new(
+                    self.p2p_tx.clone(),
+                    self.p2p_tx.subscribe(),
+                    &self.data_path,
                     peer.ip,
                     peer.port,
                     self.info_hash,
                     self.my_id,
-                    self.pieces.clone(),
+                    // self.pieces.clone(),
                     peer.peer_id,
                     self.torrent_tx.clone(),
                     Arc::clone(&self.max_peer_connections),
@@ -460,7 +535,7 @@ impl State {
         let peer_id = urlencoding::encode_binary(&self.my_id.0);
         debug!("peer id in announce: {peer_id}");
 
-        let event = self.state.to_string();
+        let event = self.tracker_state.to_string();
 
         let query_params = &[
             ("info_hash", urlencoded_info_hash),
@@ -559,16 +634,30 @@ impl State {
                 };
 
                 if have_piece {
-                    self.pieces.set(i, true);
+                    let mut pieces = PIECES.write().await;
+                    let my_pieces = pieces.get_mut(&self.info_hash).ok_or(Error::NoPieces)?;
+                    my_pieces.set(i, true);
                 } else {
-                    self.pieces.set(i, false);
+                    let mut pieces = PIECES.write().await;
+                    let my_pieces = pieces.get_mut(&self.info_hash).ok_or(Error::NoPieces)?;
+                    my_pieces.set(i, false);
                 }
             }
-
-            Ok(())
         } else {
-            Err(Error::NoMetainfo)
+            return Err(Error::NoMetainfo);
         }
+
+        let pieces = PIECES.read().await;
+        let my_pieces = pieces.get(&self.info_hash).ok_or(Error::NoPieces)?;
+
+        if my_pieces.all() {
+            self.state = TorrentState::Seeding;
+            // we don't set completed here because we probably already announced we were completed,
+            // and we don't need to do it again
+            self.tracker_state = TrackerState::Started;
+        }
+
+        Ok(())
     }
 }
 
@@ -583,7 +672,7 @@ struct AvailablePeer {
 /// via message passing. The actual torrent logic runs within its own task.
 pub(crate) struct TorrentHandle {
     tx: tokio::sync::mpsc::Sender<Message>,
-    join_handle: tokio::task::JoinHandle<()>,
+    join_handle: tokio::task::JoinHandle<Result<(), Error>>,
 }
 
 impl TorrentHandle {
@@ -603,17 +692,16 @@ impl TorrentHandle {
         timeout!(reply_rx, 5).await??
     }
 
-    /// Get the pieces we have and don't have for this torrent as a bit vector
-    pub(crate) async fn get_pieces(&self) -> Result<Pieces, Error> {
-        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-        self.tx.send(Message::GetPieces { reply_tx }).await?;
-        timeout!(reply_rx, 5).await??
-    }
-
     /// Force a re-verification of the local torrent data.
     pub(crate) async fn verify_local_data(&self) -> Result<(), Error> {
         timeout!(self.tx.send(Message::VerifyLocalData), 5).await??;
         Ok(())
+    }
+
+    pub(crate) async fn get_data_location(&self) -> Result<PathBuf, Error> {
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        timeout!(self.tx.send(Message::GetDataLocation { reply_tx }), 5).await??;
+        timeout!(reply_rx, 5).await??
     }
 }
 

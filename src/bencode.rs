@@ -77,6 +77,14 @@ impl Bencode {
         }
     }
 
+    pub(crate) fn as_u32(&self) -> u32 {
+        if let Bencode::Integer(i) = self {
+            u32::try_from(*i).unwrap()
+        } else {
+            panic!("not integer")
+        }
+    }
+
     pub(crate) fn as_str(&self) -> &str {
         if let Bencode::ByteString(s) = self {
             std::str::from_utf8(s).unwrap()
