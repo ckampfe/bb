@@ -84,8 +84,8 @@ impl<T: PartialEq> AsyncQueue<T> {
     }
 
     /// either enqueues the item or returns immediately
-    /// if there is no remaining capacity
-    /// returns true if the push was successful, false if not
+    /// if there is no remaining capacity.
+    /// returns `true` if the item was enqueued, `false` if not.
     async fn try_push_back(&mut self, item: T) -> bool {
         if self.q.len() < self.capacity {
             self.q.push_back(item);
@@ -564,29 +564,32 @@ async fn maybe_enqueue_requests(state: &mut State) -> Result<(), Error> {
     if should_download(state) {
         let unhad_pieces = unhad_pieces(&state.info_hash, &state.peer_pieces).await?;
 
-        if let Some(metainfo) = METAINFOS.read().await.get(&state.info_hash) {
-            let pieces_we_dont_have = unhad_pieces.iter_ones().take(state.requests_queue.capacity);
+        let metainfos = METAINFOS.read().await;
+        let metainfo = metainfos.get(&state.info_hash).ok_or(Error::Metainfo)?;
 
-            let pieces_and_blocks_we_dont_have = pieces_we_dont_have.map(|index| {
-                (
-                    index,
-                    metainfo.blocks_for_piece(u32::try_from(index).unwrap(), state.block_length),
-                )
-            });
+        let pieces_we_dont_have = unhad_pieces.iter_ones().take(state.requests_queue.capacity);
 
-            for (index, blocks) in pieces_and_blocks_we_dont_have {
-                for block in blocks {
-                    let request = Request {
-                        index: index.try_into().unwrap(),
-                        begin: block.begin,
-                        length: block.length,
-                    };
+        let pieces_and_blocks_we_dont_have = pieces_we_dont_have.map(|index| {
+            (
+                index,
+                metainfo.blocks_for_piece(u32::try_from(index).unwrap(), state.block_length),
+            )
+        });
 
-                    debug!("enqueing request {:?} to download", request);
+        'outer: for (index, blocks) in pieces_and_blocks_we_dont_have {
+            for block in blocks {
+                let request = Request {
+                    index: index.try_into().unwrap(),
+                    begin: block.begin,
+                    length: block.length,
+                };
 
-                    // if we can't, ignore.
-                    let _ = state.requests_queue.try_push_back(request).await;
-                }
+                debug!("enqueing request {:?} to download", request);
+
+                // once we are out of capacity, break out of the loop
+                if !state.requests_queue.try_push_back(request).await {
+                    break 'outer;
+                };
             }
         }
     }
