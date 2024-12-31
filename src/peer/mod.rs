@@ -1,8 +1,9 @@
-use crate::torrent::{self, P2PMessage, PeerId, Pieces};
+use crate::torrent::{self, AllToAllMessage, PeerId, Pieces};
 use crate::{download, timeout, InfoHash, METAINFOS, PIECES};
 use bitvec::{bitvec, order::Msb0};
 use futures::sink::SinkExt;
 use protocol::{Frame, HandshakeFrame, PeerProtocol};
+use std::collections::VecDeque;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -38,7 +39,7 @@ pub(crate) enum Error {
     #[error("no metainfo available")]
     Metainfo,
     #[error("unable to broadcast to other peers")]
-    P2PBroadcast(#[from] tokio::sync::broadcast::error::SendError<P2PMessage>),
+    P2PBroadcast(#[from] tokio::sync::broadcast::error::SendError<AllToAllMessage>),
     #[error("unable to get pieces for this torrent")]
     NoPieces,
 }
@@ -47,7 +48,7 @@ pub enum TorrentToPeer {
     Shutdown,
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 struct Request {
     index: u32,
     begin: u32,
@@ -67,33 +68,48 @@ impl From<Request> for protocol::Frame {
 /// just a dumb little thing that allows us
 /// to queue up a batch of requests so that:
 /// 1. we don't make only one download request at a time
-/// 2. we can eventually implement cancel, as the requests are reified objects
+/// 2. we can implement cancel, as the requests are reified objects
 #[derive(Debug)]
 struct AsyncQueue<T> {
     capacity: usize,
-    tx: mpsc::Sender<T>,
-    rx: mpsc::Receiver<T>,
+    q: VecDeque<T>,
 }
 
-impl<T> AsyncQueue<T> {
+impl<T: PartialEq> AsyncQueue<T> {
     fn new(capacity: usize) -> Self {
-        let (tx, rx) = mpsc::channel(capacity);
-        Self { capacity, tx, rx }
+        Self {
+            capacity,
+            q: VecDeque::with_capacity(capacity),
+        }
     }
 
     /// either enqueues the item or returns immediately
     /// if there is no remaining capacity
-    async fn try_push_back(
-        &mut self,
-        item: T,
-    ) -> Result<(), tokio::sync::mpsc::error::TrySendError<T>> {
-        self.tx.try_send(item)
+    /// returns true if the push was successful, false if not
+    async fn try_push_back(&mut self, item: T) -> bool {
+        if self.q.len() < self.capacity {
+            self.q.push_back(item);
+            true
+        } else {
+            false
+        }
     }
 
     /// either dequeues an item or returns immediately
     /// if there is no item
-    async fn try_pop_front(&mut self) -> Result<T, tokio::sync::mpsc::error::TryRecvError> {
-        self.rx.try_recv()
+    async fn try_pop_front(&mut self) -> Option<T> {
+        self.q.pop_front()
+    }
+
+    /// remove all items from the queue
+    async fn clear(&mut self) {
+        self.q.clear();
+    }
+
+    /// keep items for which `predicate` returns true
+    async fn filter<P: FnMut(&T) -> bool>(&mut self, predicate: P) {
+        let q_moved_out = std::mem::take(&mut self.q);
+        self.q = q_moved_out.into_iter().filter(predicate).collect();
     }
 }
 
@@ -101,14 +117,14 @@ impl<T> AsyncQueue<T> {
 struct State {
     info_hash: InfoHash,
     /// used to communicate status information to other peer tasks
-    p2p_tx: broadcast::Sender<P2PMessage>,
+    p2p_tx: broadcast::Sender<AllToAllMessage>,
     /// where the downloaded data lives
     // TODO make this updatable by the torrent task
     data_path: PathBuf,
     /// me
     my_id: PeerId,
     /// send messages to the owning torrent
-    torrent_tx: mpsc::Sender<torrent::Message>,
+    torrent_tx: mpsc::Sender<torrent::AllToTorrentMessage>,
     /// send data to the remote peer
     writer: FramedWrite<OwnedWriteHalf, PeerProtocol>,
     /// the pieces the remote peer has
@@ -126,15 +142,15 @@ struct State {
 /// an outgoing connection: the way we connect to a remote peer
 #[instrument(skip_all)]
 pub(crate) async fn new(
-    p2p_tx: broadcast::Sender<P2PMessage>,
-    p2p_rx: broadcast::Receiver<P2PMessage>,
+    p2p_tx: broadcast::Sender<AllToAllMessage>,
+    p2p_rx: broadcast::Receiver<AllToAllMessage>,
     data_path: &Path,
     ip: IpAddr,
     port: u16,
     info_hash: InfoHash,
     my_id: PeerId,
     remote_peer_id: Option<PeerId>,
-    torrent_tx: mpsc::Sender<torrent::Message>,
+    torrent_tx: mpsc::Sender<torrent::AllToTorrentMessage>,
     max_peer_connections: Arc<tokio::sync::Semaphore>,
 ) -> Result<PeerHandle, Error> {
     debug!("peer new");
@@ -181,15 +197,15 @@ pub(crate) async fn accept_peer_connection(socket: TcpStream) -> Result<PeerHand
 #[instrument(skip_all)]
 fn peer_loop(
     info_hash: InfoHash,
-    p2p_tx: broadcast::Sender<P2PMessage>,
-    mut p2p_rx: broadcast::Receiver<P2PMessage>,
+    p2p_tx: broadcast::Sender<AllToAllMessage>,
+    mut p2p_rx: broadcast::Receiver<AllToAllMessage>,
     data_path: &Path,
     my_id: PeerId,
     remote_peer_id: PeerId,
     mut reader: FramedRead<OwnedReadHalf, PeerProtocol>,
     mut writer: FramedWrite<OwnedWriteHalf, PeerProtocol>,
     ip: IpAddr,
-    torrent_tx: mpsc::Sender<torrent::Message>,
+    torrent_tx: mpsc::Sender<torrent::AllToTorrentMessage>,
     permit: tokio::sync::SemaphorePermit<'static>,
     torrent_permit: tokio::sync::OwnedSemaphorePermit,
 ) -> PeerHandle {
@@ -216,7 +232,7 @@ fn peer_loop(
         let mut timeout_timer = interval(Duration::from_secs(30));
         timeout_timer.reset();
 
-        let mut requests_timer = interval(Duration::from_secs(3));
+        let mut requests_timer = interval(Duration::from_secs(1));
         requests_timer.reset();
 
         let pieces_length =  {
@@ -245,16 +261,19 @@ fn peer_loop(
             select! {
                 Ok(m) = p2p_rx.recv() => {
                     match m {
-                        P2PMessage::Have { index } => {
+                        AllToAllMessage::WeHave { index } => {
                             state.writer.send(Frame::Have { index }).await?;
                             debug!("told remote peer that I have {}", index);
                         },
+                        AllToAllMessage::DownloadComplete => {
+                            state.i_am_interested_in_peer = false;
+                        }
                     }
                 }
                 _ = requests_timer.tick() => {
                     maybe_enqueue_requests(&mut state).await?;
                 }
-                Ok(request) = state.requests_queue.try_pop_front() => {
+                Some(request) = state.requests_queue.try_pop_front() => {
                     debug!("requesting piece {:?} from {:?}", request, remote_peer_id);
                     let _ = timeout!(state.writer.send(request.into()), 5).await?;
                 }
@@ -297,7 +316,7 @@ fn peer_loop(
                                 },
                                 protocol::Frame::Cancel { index, begin, length } => {
                                     debug!("received cancel");
-                                    handle_cancel(&state, index, begin, length).await?
+                                    handle_cancel(&mut state, index, begin, length).await?
                                 },
                             }
                         }
@@ -307,7 +326,7 @@ fn peer_loop(
                         },
                         None => {
                             debug!("got None reading from remote peer {:?}, disconnecting.", remote_peer_id);
-                            let _ = state.torrent_tx.send(torrent::Message::PeerDisconnection { peer_id: remote_peer_id }).await;
+                            let _ = state.torrent_tx.send(torrent::AllToTorrentMessage::PeerDisconnection { peer_id: remote_peer_id }).await;
                             break
                         }
                     }
@@ -352,7 +371,7 @@ fn right_but_not_left(left: &Pieces, right: &Pieces) -> Pieces {
 #[instrument(skip_all)]
 async fn handle_choke(state: &mut State) -> Result<(), Error> {
     state.peer_is_choking_me = true;
-    // TODO cancel any queued requests
+    state.requests_queue.clear().await;
     Ok(())
 }
 
@@ -360,48 +379,6 @@ async fn handle_choke(state: &mut State) -> Result<(), Error> {
 async fn handle_unchoke(state: &mut State) -> Result<(), Error> {
     state.peer_is_choking_me = false;
     Ok(())
-}
-
-async fn maybe_enqueue_requests(state: &mut State) -> Result<(), Error> {
-    if should_download(state) {
-        let unhad_pieces = {
-            let pieces = PIECES.read().await;
-            let my_pieces = pieces.get(&state.info_hash).ok_or(Error::NoPieces)?;
-            right_but_not_left(my_pieces, &state.peer_pieces)
-        };
-
-        if let Some(metainfo) = METAINFOS.read().await.get(&state.info_hash) {
-            let pieces_we_dont_have = unhad_pieces.iter_ones().take(state.requests_queue.capacity);
-
-            let pieces_and_blocks_we_dont_have = pieces_we_dont_have.map(|index| {
-                (
-                    index,
-                    metainfo.blocks_for_piece(u32::try_from(index).unwrap(), state.block_length),
-                )
-            });
-
-            for (index, blocks) in pieces_and_blocks_we_dont_have {
-                for block in blocks {
-                    let request = Request {
-                        index: index.try_into().unwrap(),
-                        begin: block.begin,
-                        length: block.length,
-                    };
-
-                    debug!("enqueing request {:?} to download", request);
-
-                    // if we can't, ignore.
-                    let _ = state.requests_queue.try_push_back(request).await;
-                }
-            }
-        }
-    }
-
-    Ok(())
-}
-
-fn should_download(state: &mut State) -> bool {
-    state.i_am_interested_in_peer && !state.peer_is_choking_me
 }
 
 #[instrument(skip_all)]
@@ -419,6 +396,11 @@ async fn handle_not_interested(state: &mut State) -> Result<(), Error> {
 #[instrument(skip_all)]
 async fn handle_have(state: &mut State, index: u32) -> Result<(), Error> {
     state.peer_pieces.set(index.try_into().unwrap(), true);
+
+    if peer_has_pieces_we_want(&state.info_hash, &state.peer_pieces).await? {
+        state.i_am_interested_in_peer = true;
+    }
+
     Ok(())
 }
 
@@ -440,6 +422,10 @@ async fn handle_bitfield(state: &mut State, peer_pieces: Pieces) -> Result<(), E
 
 #[instrument(skip(state))]
 async fn handle_request(state: &State, index: u32, begin: u32, length: u32) -> Result<(), Error> {
+    if state.i_am_choking_peer {
+        return Ok(());
+    }
+
     todo!()
 }
 
@@ -456,7 +442,6 @@ async fn handle_piece(
     );
 
     if let Some(metainfo) = METAINFOS.read().await.get(&state.info_hash) {
-        debug!("here1");
         let mut write_location = state.data_path.clone();
 
         write_location.push(metainfo.name());
@@ -474,7 +459,7 @@ async fn handle_piece(
             let my_pieces = pieces.get_mut(&state.info_hash).ok_or(Error::NoPieces)?;
             my_pieces.set(index as usize, true);
             debug!("piece verified");
-            state.p2p_tx.send(P2PMessage::Have { index })?;
+            state.p2p_tx.send(AllToAllMessage::WeHave { index })?;
         } else {
             debug!("piece did not verify");
         }
@@ -486,11 +471,26 @@ async fn handle_piece(
 }
 
 #[instrument(skip(state))]
-async fn handle_cancel(state: &State, index: u32, begin: u32, length: u32) -> Result<(), Error> {
-    todo!()
+async fn handle_cancel(
+    state: &mut State,
+    index: u32,
+    begin: u32,
+    length: u32,
+) -> Result<(), Error> {
+    let to_remove = Request {
+        index,
+        begin,
+        length,
+    };
+
+    state
+        .requests_queue
+        .filter(|request| request != &to_remove)
+        .await;
+
+    Ok(())
 }
 
-// TODO have this use its own codec
 #[instrument(skip(socket))]
 async fn handshake_peer(
     socket: &mut tokio::net::TcpStream,
@@ -531,12 +531,63 @@ async fn handshake_peer(
     Ok(handshake_frame)
 }
 
+async fn maybe_enqueue_requests(state: &mut State) -> Result<(), Error> {
+    if should_download(state) {
+        let unhad_pieces = unhad_pieces(&state.info_hash, &state.peer_pieces).await?;
+
+        if let Some(metainfo) = METAINFOS.read().await.get(&state.info_hash) {
+            let pieces_we_dont_have = unhad_pieces.iter_ones().take(state.requests_queue.capacity);
+
+            let pieces_and_blocks_we_dont_have = pieces_we_dont_have.map(|index| {
+                (
+                    index,
+                    metainfo.blocks_for_piece(u32::try_from(index).unwrap(), state.block_length),
+                )
+            });
+
+            for (index, blocks) in pieces_and_blocks_we_dont_have {
+                for block in blocks {
+                    let request = Request {
+                        index: index.try_into().unwrap(),
+                        begin: block.begin,
+                        length: block.length,
+                    };
+
+                    debug!("enqueing request {:?} to download", request);
+
+                    // if we can't, ignore.
+                    let _ = state.requests_queue.try_push_back(request).await;
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn should_download(state: &mut State) -> bool {
+    state.i_am_interested_in_peer && !state.peer_is_choking_me
+}
+
+async fn unhad_pieces(info_hash: &InfoHash, peer_pieces: &Pieces) -> Result<Pieces, Error> {
+    let pieces = PIECES.read().await;
+    let my_pieces = pieces.get(&info_hash).ok_or(Error::NoPieces)?;
+    Ok(right_but_not_left(my_pieces, peer_pieces))
+}
+
+async fn peer_has_pieces_we_want(
+    info_hash: &InfoHash,
+    peer_pieces: &Pieces,
+) -> Result<bool, Error> {
+    Ok(unhad_pieces(info_hash, peer_pieces).await?.any())
+}
+
 #[derive(Debug)]
 pub(crate) struct PeerHandle {
     /// the id of the remote peer
     pub remote_peer_id: PeerId,
     pub ip: IpAddr,
-    /// this is the channel by which we get messages to the peer
+    /// this is the channel by which we get messages from the torrent task to the peer task
     peer_tx: mpsc::Sender<TorrentToPeer>,
     /// in case we need to kill the task or figure out why it panicked
     task_handle: JoinHandle<Result<(), Error>>,
