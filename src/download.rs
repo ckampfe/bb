@@ -20,6 +20,32 @@ pub(crate) async fn write_block(
     Ok(())
 }
 
+pub(crate) async fn read_block(
+    metainfo: &MetaInfo,
+    file: &mut File,
+    piece_index: u32,
+    block_begin: u32,
+    block_length: u32,
+) -> Result<Vec<u8>, std::io::Error> {
+    if block_length > metainfo.actual_piece_length(piece_index) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::FileTooLarge,
+            "block length must not exceed piece length",
+        ));
+    }
+
+    let piece_offset = metainfo.piece_offset(piece_index);
+
+    file.seek(std::io::SeekFrom::Start(piece_offset + block_begin as u64))
+        .await?;
+
+    let mut block = vec![0u8; block_length.try_into().unwrap()];
+
+    file.read_exact(&mut block).await?;
+
+    Ok(block)
+}
+
 pub(crate) async fn verify_piece(
     metainfo: &MetaInfo,
     file: &mut File,

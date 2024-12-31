@@ -308,7 +308,7 @@ fn peer_loop(
                                 },
                                 protocol::Frame::Request { index, begin, length } => {
                                     debug!("received request");
-                                    handle_request(&state, index, begin, length).await?;
+                                    handle_request(&mut state, index, begin, length).await?;
                                 },
                                 protocol::Frame::Piece { index, begin, block } => {
                                     debug!("received piece");
@@ -421,12 +421,41 @@ async fn handle_bitfield(state: &mut State, peer_pieces: Pieces) -> Result<(), E
 }
 
 #[instrument(skip(state))]
-async fn handle_request(state: &State, index: u32, begin: u32, length: u32) -> Result<(), Error> {
+async fn handle_request(
+    state: &mut State,
+    index: u32,
+    begin: u32,
+    length: u32,
+) -> Result<(), Error> {
     if state.i_am_choking_peer {
         return Ok(());
     }
 
-    todo!()
+    let metainfos = METAINFOS.read().await;
+    let metainfo = metainfos.get(&state.info_hash).ok_or(Error::Metainfo)?;
+
+    let mut write_location = state.data_path.clone();
+
+    write_location.push(metainfo.name());
+
+    let mut file = tokio::fs::File::options()
+        .write(true)
+        .read(true)
+        .open(write_location)
+        .await?;
+
+    let block = download::read_block(metainfo, &mut file, index, begin, length).await?;
+
+    state
+        .writer
+        .send(Frame::Piece {
+            index,
+            begin,
+            block,
+        })
+        .await?;
+
+    Ok(())
 }
 
 #[instrument(skip(state, block))]
@@ -571,7 +600,7 @@ fn should_download(state: &mut State) -> bool {
 
 async fn unhad_pieces(info_hash: &InfoHash, peer_pieces: &Pieces) -> Result<Pieces, Error> {
     let pieces = PIECES.read().await;
-    let my_pieces = pieces.get(&info_hash).ok_or(Error::NoPieces)?;
+    let my_pieces = pieces.get(info_hash).ok_or(Error::NoPieces)?;
     Ok(right_but_not_left(my_pieces, peer_pieces))
 }
 

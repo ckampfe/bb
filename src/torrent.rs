@@ -18,7 +18,6 @@ use thiserror::Error;
 use tokio::fs::OpenOptions;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio::select;
-use tokio::sync::broadcast::error;
 use tokio::sync::{broadcast, mpsc, oneshot, Semaphore};
 use tokio::time::Interval;
 use tracing::{debug, info};
