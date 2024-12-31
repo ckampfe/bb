@@ -38,6 +38,8 @@ pub enum Error {
     Torrent(#[from] torrent::Error),
     #[error("unable to get pieces for this torrent")]
     NoPieces,
+    #[error("can't add torrent because this torrent already exists")]
+    TorrentAlreadyExists,
 }
 
 // is this a good idea? bad idea?
@@ -59,8 +61,14 @@ pub async fn new_torrent<P: AsRef<Path>>(
     options: torrent::Options,
 ) -> Result<InfoHash, Error> {
     let (info_hash, torrent_handle) = torrent::new(dot_torrent_path, data_path, options).await?;
+
     {
         let mut torrents = TORRENTS.write().await;
+
+        if torrents.contains_key(&info_hash) {
+            return Err(Error::TorrentAlreadyExists);
+        }
+
         torrents.insert(info_hash, torrent_handle);
     }
 
