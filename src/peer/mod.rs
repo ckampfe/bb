@@ -446,14 +446,15 @@ async fn handle_request(
 
     let block = download::read_block(metainfo, &mut file, index, begin, length).await?;
 
-    state
-        .writer
-        .send(Frame::Piece {
+    timeout!(
+        state.writer.send(Frame::Piece {
             index,
             begin,
             block,
-        })
-        .await?;
+        }),
+        3
+    )
+    .await??;
 
     Ok(())
 }
