@@ -18,9 +18,10 @@ use thiserror::Error;
 use tokio::fs::OpenOptions;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio::select;
-use tokio::sync::{broadcast, mpsc, Semaphore};
+use tokio::sync::broadcast::error;
+use tokio::sync::{broadcast, mpsc, oneshot, Semaphore};
 use tokio::time::Interval;
-use tracing::debug;
+use tracing::{debug, info};
 
 pub type Pieces = BitVec<u8, bitvec::order::Msb0>;
 
@@ -42,9 +43,9 @@ pub enum Error {
     #[error("bencode error")]
     Bencode(#[from] bencode::Error),
     #[error("oneshot channel error")]
-    OneshotChannelRecv(#[from] tokio::sync::oneshot::error::RecvError),
+    OneshotChannelRecv(#[from] oneshot::error::RecvError),
     #[error("coudl not send on channel")]
-    MpscSend(#[from] tokio::sync::mpsc::error::SendError<Message>),
+    MpscSend(#[from] mpsc::error::SendError<AllToTorrentMessage>),
     #[error("timeout")]
     Timeout(#[from] tokio::time::error::Elapsed),
     #[error("announce")]
@@ -55,9 +56,12 @@ pub enum Error {
     NoMetainfo,
     #[error("unable to get pieces for this torrent")]
     NoPieces,
+    #[error("ldfjdf")]
+    InternalBroadcast(#[from] broadcast::error::SendError<AllToAllMessage>),
 }
 
-pub(crate) enum Message {
+/// used to send messages to the torrent only
+pub enum AllToTorrentMessage {
     GetState {
         reply_tx: tokio::sync::oneshot::Sender<Result<String, Error>>,
     },
@@ -71,6 +75,21 @@ pub(crate) enum Message {
     GetDataLocation {
         reply_tx: tokio::sync::oneshot::Sender<Result<PathBuf, Error>>,
     },
+}
+
+/// used in 2 scenarios:
+/// - torrent to send message to all peers
+/// - peer to send message to all other peers
+#[derive(Clone, Copy, Debug)]
+pub enum AllToAllMessage {
+    /// peers broadcast this message to let the other peers in the cluster know
+    /// that they have a message.
+    /// named this way to differentiate it from `Frame::Have`,
+    /// to indicate that we are the ones who now have a piece, not a remote peer.
+    WeHave {
+        index: u32,
+    },
+    DownloadComplete,
 }
 
 #[derive(Debug)]
@@ -106,24 +125,14 @@ struct State {
     state: TorrentState,
     tracker_state: TrackerState,
     max_peer_connections: Arc<Semaphore>,
-    torrent_tx: mpsc::Sender<Message>,
-    p2p_tx: broadcast::Sender<P2PMessage>,
+    torrent_tx: mpsc::Sender<AllToTorrentMessage>,
+    p2p_tx: broadcast::Sender<AllToAllMessage>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 enum TorrentState {
     Seeding,
     Leaching,
-}
-
-/// used in 2 scenarios:
-/// - torrent to send message to all peers
-/// - peer to send message to all other peers
-#[derive(Clone, Copy, Debug)]
-pub(crate) enum P2PMessage {
-    /// peers broadcast this message to let the other peers in the cluster know
-    /// that they have a message
-    Have { index: u32 },
 }
 
 /// stats for a single peer
@@ -289,28 +298,33 @@ fn torrent_loop(
                     match m {
                         // every time a peer reports that we now have a new piece,
                         // check if we are done
-                        P2PMessage::Have { .. } => {
+                        AllToAllMessage::WeHave { .. } => {
                             let pieces = PIECES.read().await;
 
                             let my_pieces = pieces.get(&info_hash).ok_or(Error::NoPieces)?;
 
                             if my_pieces.all() {
                                 // we are done!
+                                info!("download complete {:?}", info_hash);
+
+                                state.p2p_tx.send(AllToAllMessage::DownloadComplete)?;
+
                                 state.state = TorrentState::Seeding;
                                 state.tracker_state = TrackerState::Completed;
 
                                 state.announce().await?;
                             }
                         },
+                        AllToAllMessage::DownloadComplete => {}
                     }
                 }
                 m = torrent_rx.recv() => {
                     let m = m.unwrap();
                     match m {
-                        Message::GetState { reply_tx } => {
+                        AllToTorrentMessage::GetState { reply_tx } => {
                             let _ = reply_tx.send(Ok(format!("{:?}", state)));
                         }
-                        Message::Announce { reply_tx } => {
+                        AllToTorrentMessage::Announce { reply_tx } => {
                             match state.announce().await {
                                 Ok(response) => {
                                     state.handle_announce(&mut announce_timer, response.clone());
@@ -334,7 +348,7 @@ fn torrent_loop(
                         //         todo!()
                         //     }
                         // }
-                        Message::PeerDisconnection { peer_id } => {
+                        AllToTorrentMessage::PeerDisconnection { peer_id } => {
                             let idx = state.connected_peers.iter().position(|peer| {
                                 peer.remote_peer_id == peer_id
                             });
@@ -343,17 +357,19 @@ fn torrent_loop(
                                 debug!("removed peer {:?} due to disconnection", peer.remote_peer_id);
                             }
                         }
-                        Message::VerifyLocalData => {
+                        AllToTorrentMessage::VerifyLocalData => {
                             let _ = state.verify_local_data().await;
                         }
-                        Message::GetDataLocation { reply_tx } => {
+                        AllToTorrentMessage::GetDataLocation { reply_tx } => {
                             let _ = reply_tx.send(Ok(state.data_path.clone()));
                         }
                     }
                 }
                 _ = peer_connect_timer.tick() => {
                     debug!("peer connect timer");
-                    state.evaluate_and_connect_to_peers().await;
+                    if state.state != TorrentState::Seeding {
+                        state.evaluate_and_connect_to_peers().await;
+                    }
                 }
                 _ = announce_timer.tick() => {
                     match state.announce().await {
@@ -671,7 +687,7 @@ struct AvailablePeer {
 /// An opaque handle to a torrent that allows interaction with that torrent
 /// via message passing. The actual torrent logic runs within its own task.
 pub(crate) struct TorrentHandle {
-    tx: tokio::sync::mpsc::Sender<Message>,
+    tx: tokio::sync::mpsc::Sender<AllToTorrentMessage>,
     join_handle: tokio::task::JoinHandle<Result<(), Error>>,
 }
 
@@ -679,7 +695,9 @@ impl TorrentHandle {
     /// The state of the torrent, dumped as a `Debug` string.
     pub(crate) async fn get_state_debug_string(&self) -> Result<String, Error> {
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-        self.tx.send(Message::GetState { reply_tx }).await?;
+        self.tx
+            .send(AllToTorrentMessage::GetState { reply_tx })
+            .await?;
         timeout!(reply_rx, 5).await??
     }
 
@@ -688,19 +706,26 @@ impl TorrentHandle {
     /// if the torrent has announced recently.
     pub(crate) async fn force_announce(&self) -> Result<Bencode, Error> {
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-        self.tx.send(Message::Announce { reply_tx }).await?;
+        self.tx
+            .send(AllToTorrentMessage::Announce { reply_tx })
+            .await?;
         timeout!(reply_rx, 5).await??
     }
 
     /// Force a re-verification of the local torrent data.
     pub(crate) async fn verify_local_data(&self) -> Result<(), Error> {
-        timeout!(self.tx.send(Message::VerifyLocalData), 5).await??;
+        timeout!(self.tx.send(AllToTorrentMessage::VerifyLocalData), 5).await??;
         Ok(())
     }
 
     pub(crate) async fn get_data_location(&self) -> Result<PathBuf, Error> {
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-        timeout!(self.tx.send(Message::GetDataLocation { reply_tx }), 5).await??;
+        timeout!(
+            self.tx
+                .send(AllToTorrentMessage::GetDataLocation { reply_tx }),
+            5
+        )
+        .await??;
         timeout!(reply_rx, 5).await??
     }
 }

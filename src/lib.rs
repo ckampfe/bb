@@ -5,6 +5,11 @@
 //       could probably use https://docs.rs/tokio/latest/tokio/sync/index.html#watch-channel
 // - [ ] accept incoming connections
 // - [ ] have peer tasks send stats...somewhere. we want to be able to use them in the choking algorithm
+// - [ ] figure out what actually should be public.
+//       current problem is that we have errors that should be opaque but are not,
+//       and so they're leaking internal implementation information.
+//       figure out how to use thiserror to roll up multiple internal errors into a
+//       single opaque error.
 
 use base64::Engine;
 use bencode::Bencode;

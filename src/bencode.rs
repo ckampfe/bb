@@ -112,7 +112,7 @@ impl<I> nom::error::ParseError<I> for CustomError<I> {
 }
 
 #[derive(Debug, Error)]
-pub(crate) enum Error {
+pub enum Error {
     #[error("could not decode from bencoded data")]
     DecodeError(String),
     #[error("could not encode to bencode data")]
