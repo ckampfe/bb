@@ -20,8 +20,10 @@
 // - [ ] figure out if it makes sense to download to something like `filename.jpg.part` vs. just `filename.jpg`
 
 use base64::Engine;
+pub use client::{Client, Options as ClientOptions};
 use std::fmt::Debug;
 use thiserror::Error;
+pub use torrent::Options as TorrentOptions;
 
 mod bencode;
 mod client;
@@ -30,14 +32,22 @@ mod metainfo;
 mod peer;
 pub mod torrent;
 
-pub use client::{Client, Options as ClientOptions};
-pub use torrent::Options as TorrentOptions;
-
 /// uniquely identifies a torrent
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct InfoHash(pub [u8; 20]);
 
 impl Debug for InfoHash {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let base64 = base64::prelude::BASE64_STANDARD.encode(self.0);
+        write!(f, "{}", base64)
+    }
+}
+
+/// uniquely identifies a peer
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) struct PeerId(pub [u8; 20]);
+
+impl Debug for PeerId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let base64 = base64::prelude::BASE64_STANDARD.encode(self.0);
         write!(f, "{}", base64)

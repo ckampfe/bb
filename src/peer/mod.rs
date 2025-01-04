@@ -1,6 +1,6 @@
 use crate::metainfo::MetaInfo;
-use crate::torrent::{self, AllToAllMessage, PeerId, Pieces};
-use crate::{download, timeout, InfoHash};
+use crate::torrent::{self, AllToAllMessage, Pieces};
+use crate::{download, timeout, InfoHash, PeerId};
 use bitvec::{bitvec, order::Msb0};
 use futures::sink::SinkExt;
 use protocol::{Frame, HandshakeFrame, PeerProtocol};

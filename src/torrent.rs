@@ -1,8 +1,7 @@
 use crate::bencode::{self, Bencode};
 use crate::metainfo::MetaInfo;
 use crate::peer::{self, PeerHandle};
-use crate::{timeout, InfoHash};
-use base64::Engine;
+use crate::{timeout, InfoHash, PeerId};
 use bitvec::prelude::*;
 use bitvec::vec::BitVec;
 use rand::Rng;
@@ -25,17 +24,6 @@ use tokio_util::task::TaskTracker;
 use tracing::{debug, info};
 
 pub type Pieces = BitVec<u8, bitvec::order::Msb0>;
-
-/// uniquely identifies a peer
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub(crate) struct PeerId(pub [u8; 20]);
-
-impl Debug for PeerId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let base64 = base64::prelude::BASE64_STANDARD.encode(self.0);
-        write!(f, "{}", base64)
-    }
-}
 
 #[derive(Debug, Error)]
 pub enum Error {
