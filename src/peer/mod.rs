@@ -1,5 +1,6 @@
+use crate::metainfo::MetaInfo;
 use crate::torrent::{self, AllToAllMessage, PeerId, Pieces};
-use crate::{download, timeout, InfoHash, METAINFOS, PIECES};
+use crate::{download, timeout, InfoHash};
 use bitvec::{bitvec, order::Msb0};
 use futures::sink::SinkExt;
 use protocol::{Frame, HandshakeFrame, PeerProtocol};
@@ -11,11 +12,13 @@ use std::time::Duration;
 use thiserror::Error;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::TcpStream;
-use tokio::sync::{broadcast, mpsc, TryAcquireError};
+use tokio::sync::{broadcast, mpsc, RwLock, Semaphore, TryAcquireError};
 use tokio::time::interval;
 use tokio::{select, task::JoinHandle, time::error::Elapsed};
 use tokio_stream::StreamExt;
 use tokio_util::codec::{FramedRead, FramedWrite};
+use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 use tracing::{debug, instrument};
 
 mod protocol;
@@ -116,6 +119,7 @@ impl<T: PartialEq> AsyncQueue<T> {
 // TODO implement Debug manually for this, since it contains undebuggable fields
 struct State {
     info_hash: InfoHash,
+    metainfo: Arc<MetaInfo>,
     /// used to communicate status information to other peer tasks
     p2p_tx: broadcast::Sender<AllToAllMessage>,
     /// where the downloaded data lives
@@ -129,10 +133,13 @@ struct State {
     writer: FramedWrite<OwnedWriteHalf, PeerProtocol>,
     /// the pieces the remote peer has
     peer_pieces: Pieces,
+    /// the pieces we have
+    my_pieces: Arc<RwLock<Pieces>>,
     /// the length of *blocks*, which are the subcomponent of pieces
     block_length: u32,
     /// the requests to the remote peer for data.
     requests_queue: AsyncQueue<Request>,
+    cancellation_token: CancellationToken,
     i_am_choking_peer: bool,
     i_am_interested_in_peer: bool,
     peer_is_choking_me: bool,
@@ -142,21 +149,27 @@ struct State {
 /// an outgoing connection: the way we connect to a remote peer
 #[instrument(skip_all)]
 pub(crate) async fn new(
+    pieces: Arc<RwLock<Pieces>>,
     p2p_tx: broadcast::Sender<AllToAllMessage>,
     p2p_rx: broadcast::Receiver<AllToAllMessage>,
     data_path: &Path,
     ip: IpAddr,
     port: u16,
     info_hash: InfoHash,
+    metainfo: Arc<MetaInfo>,
     my_id: PeerId,
     remote_peer_id: Option<PeerId>,
     torrent_tx: mpsc::Sender<torrent::AllToTorrentMessage>,
-    max_peer_connections: Arc<tokio::sync::Semaphore>,
+    task_tracker: TaskTracker,
+    cancellation_token: CancellationToken,
+    max_torrent_connections: Arc<Semaphore>,
+    global_max_connections: Arc<Semaphore>,
 ) -> Result<PeerHandle, Error> {
     debug!("peer new");
-    let permit = crate::GLOBAL_MAX_CONNECTIONS.try_acquire()?;
+    // let permit = crate::GLOBAL_MAX_CONNECTIONS.try_acquire()?;
+    let global_permit = global_max_connections.try_acquire_owned()?;
     debug!("got global permit");
-    let torrent_permit = max_peer_connections.try_acquire_owned()?;
+    let torrent_permit = max_torrent_connections.try_acquire_owned()?;
     debug!("got torrent permit");
 
     let mut socket = tokio::net::TcpStream::connect((ip, port)).await?;
@@ -171,7 +184,9 @@ pub(crate) async fn new(
     debug!("reader and writer");
 
     let peer_handle = peer_loop(
+        pieces,
         info_hash,
+        metainfo,
         p2p_tx,
         p2p_rx,
         data_path,
@@ -181,8 +196,10 @@ pub(crate) async fn new(
         writer,
         ip,
         torrent_tx,
-        permit,
+        task_tracker,
+        cancellation_token,
         torrent_permit,
+        global_permit,
     );
 
     Ok(peer_handle)
@@ -196,7 +213,9 @@ pub(crate) async fn accept_peer_connection(socket: TcpStream) -> Result<PeerHand
 /// the peer's main processing loop
 #[instrument(skip_all)]
 fn peer_loop(
+    my_pieces: Arc<RwLock<Pieces>>,
     info_hash: InfoHash,
+    metainfo: Arc<MetaInfo>,
     p2p_tx: broadcast::Sender<AllToAllMessage>,
     mut p2p_rx: broadcast::Receiver<AllToAllMessage>,
     data_path: &Path,
@@ -206,25 +225,30 @@ fn peer_loop(
     mut writer: FramedWrite<OwnedWriteHalf, PeerProtocol>,
     ip: IpAddr,
     torrent_tx: mpsc::Sender<torrent::AllToTorrentMessage>,
-    permit: tokio::sync::SemaphorePermit<'static>,
+    task_tracker: TaskTracker,
+    cancellation_token: CancellationToken,
     torrent_permit: tokio::sync::OwnedSemaphorePermit,
+    global_permit: tokio::sync::OwnedSemaphorePermit,
 ) -> PeerHandle {
     debug!("entered peer loop fn");
     let data_path = data_path.to_path_buf();
 
     let (peer_tx, mut peer_rx) = mpsc::channel(10);
 
-    let rt = tokio::runtime::Handle::current();
-
-    let task_handle = rt.spawn(async move {
+    let task_handle = task_tracker.spawn(async move {
         debug!("entered peer loop task");
-        let _permit = permit;
+        let _global_permit = global_permit;
         let _torrent_permit = torrent_permit;
 
         // send the initial bitfield, we do not treat this as part of the handshake
+        // {
+        //     let pieces = PIECES.read().await;
+        //     let my_pieces = pieces.get(&info_hash).ok_or(Error::NoPieces)?;
+        //     timeout!(writer.send(Frame::Bitfield { pieces: my_pieces.to_owned() }), 5).await??;
+        //     debug!("sent bitfield")
+        // }
         {
-            let pieces = PIECES.read().await;
-            let my_pieces = pieces.get(&info_hash).ok_or(Error::NoPieces)?;
+            let my_pieces = my_pieces.read().await;
             timeout!(writer.send(Frame::Bitfield { pieces: my_pieces.to_owned() }), 5).await??;
             debug!("sent bitfield")
         }
@@ -235,22 +259,28 @@ fn peer_loop(
         let mut requests_timer = interval(Duration::from_secs(1));
         requests_timer.reset();
 
-        let pieces_length =  {
-            let pieces = PIECES.read().await;
-            pieces.get(&info_hash).map(|pieces| pieces.len()).ok_or(Error::NoPieces)?
+        // let pieces_length =  {
+        //     let pieces = PIECES.read().await;
+        //     pieces.get(&info_hash).map(|pieces| pieces.len()).ok_or(Error::NoPieces)?
+        // };
+        let pieces_length = {
+            my_pieces.read().await.len()
         };
 
         let mut state = State {
             p2p_tx,
+            metainfo,
             data_path,
             info_hash,
             my_id,
             torrent_tx,
             writer,
             peer_pieces: bitvec![u8, Msb0; 0; pieces_length],
+            my_pieces,
             // TODO make this configurable
             block_length: 2u32.pow(14),
             requests_queue: AsyncQueue::new(10),
+            cancellation_token,
             i_am_choking_peer: true,
             i_am_interested_in_peer: false,
             peer_is_choking_me: true,
@@ -259,6 +289,10 @@ fn peer_loop(
 
         loop {
             select! {
+                _ = state.cancellation_token.cancelled() => {
+                    debug!("{:?} shutting down peer connection task to {:?}", state.info_hash, remote_peer_id);
+                    break;
+                }
                 Ok(m) = p2p_rx.recv() => {
                     match m {
                         AllToAllMessage::WeHave { index } => {
@@ -397,7 +431,8 @@ async fn handle_not_interested(state: &mut State) -> Result<(), Error> {
 async fn handle_have(state: &mut State, index: u32) -> Result<(), Error> {
     state.peer_pieces.set(index.try_into().unwrap(), true);
 
-    if peer_has_pieces_we_want(&state.info_hash, &state.peer_pieces).await? {
+    let my_pieces = state.my_pieces.read().await;
+    if peer_has_pieces_we_want(&my_pieces, &state.peer_pieces).await? {
         state.i_am_interested_in_peer = true;
     }
 
@@ -408,10 +443,11 @@ async fn handle_have(state: &mut State, index: u32) -> Result<(), Error> {
 async fn handle_bitfield(state: &mut State, peer_pieces: Pieces) -> Result<(), Error> {
     state.peer_pieces = peer_pieces;
 
-    let pieces = PIECES.read().await;
-    let my_pieces = pieces.get(&state.info_hash).ok_or(Error::NoPieces)?;
+    // let pieces = PIECES.read().await;
+    // let my_pieces = pieces.get(&state.info_hash).ok_or(Error::NoPieces)?;
+    let my_pieces = state.my_pieces.read().await;
 
-    if right_but_not_left(my_pieces, &state.peer_pieces).any() {
+    if right_but_not_left(&my_pieces, &state.peer_pieces).any() {
         debug!("i am interested because of bitfield");
         state.i_am_interested_in_peer = true;
         timeout!(state.writer.send(Frame::Interested), 5).await??;
@@ -431,12 +467,12 @@ async fn handle_request(
         return Ok(());
     }
 
-    let metainfos = METAINFOS.read().await;
-    let metainfo = metainfos.get(&state.info_hash).ok_or(Error::Metainfo)?;
+    // let metainfos = METAINFOS.read().await;
+    // let metainfo = metainfos.get(&state.info_hash).ok_or(Error::Metainfo)?;
 
     let mut write_location = state.data_path.clone();
 
-    write_location.push(metainfo.name());
+    write_location.push(state.metainfo.name());
 
     let mut file = tokio::fs::File::options()
         .write(true)
@@ -444,7 +480,7 @@ async fn handle_request(
         .open(write_location)
         .await?;
 
-    let block = download::read_block(metainfo, &mut file, index, begin, length).await?;
+    let block = download::read_block(&state.metainfo, &mut file, index, begin, length).await?;
 
     timeout!(
         state.writer.send(Frame::Piece {
@@ -471,30 +507,25 @@ async fn handle_piece(
         begin = ?begin,
     );
 
-    if let Some(metainfo) = METAINFOS.read().await.get(&state.info_hash) {
-        let mut write_location = state.data_path.clone();
+    let mut write_location = state.data_path.clone();
 
-        write_location.push(metainfo.name());
+    write_location.push(state.metainfo.name());
 
-        let mut file = tokio::fs::File::options()
-            .write(true)
-            .read(true)
-            .open(write_location)
-            .await?;
+    let mut file = tokio::fs::File::options()
+        .write(true)
+        .read(true)
+        .open(write_location)
+        .await?;
 
-        download::write_block(metainfo, &mut file, index, begin, block).await?;
+    download::write_block(&state.metainfo, &mut file, index, begin, block).await?;
 
-        if download::verify_piece(metainfo, &mut file, index).await? {
-            let mut pieces = timeout!(PIECES.write(), 2).await?;
-            let my_pieces = pieces.get_mut(&state.info_hash).ok_or(Error::NoPieces)?;
-            my_pieces.set(index as usize, true);
-            debug!("piece verified");
-            state.p2p_tx.send(AllToAllMessage::WeHave { index })?;
-        } else {
-            debug!("piece did not verify");
-        }
+    if download::verify_piece(&state.metainfo, &mut file, index).await? {
+        let mut my_pieces = timeout!(state.my_pieces.write(), 2).await?;
+        my_pieces.set(index as usize, true);
+        debug!("piece verified");
+        state.p2p_tx.send(AllToAllMessage::WeHave { index })?;
     } else {
-        return Err(Error::Metainfo);
+        debug!("piece did not verify");
     }
 
     Ok(())
@@ -563,17 +594,22 @@ async fn handshake_peer(
 
 async fn maybe_enqueue_requests(state: &mut State) -> Result<(), Error> {
     if should_download(state) {
-        let unhad_pieces = unhad_pieces(&state.info_hash, &state.peer_pieces).await?;
+        let unhad_pieces = {
+            let my_pieces = state.my_pieces.read().await;
+            unhad_pieces(&my_pieces, &state.peer_pieces).await?
+        };
 
-        let metainfos = METAINFOS.read().await;
-        let metainfo = metainfos.get(&state.info_hash).ok_or(Error::Metainfo)?;
+        // let metainfos = METAINFOS.read().await;
+        // let metainfo = metainfos.get(&state.info_hash).ok_or(Error::Metainfo)?;
 
         let pieces_we_dont_have = unhad_pieces.iter_ones().take(state.requests_queue.capacity);
 
         let pieces_and_blocks_we_dont_have = pieces_we_dont_have.map(|index| {
             (
                 index,
-                metainfo.blocks_for_piece(u32::try_from(index).unwrap(), state.block_length),
+                state
+                    .metainfo
+                    .blocks_for_piece(u32::try_from(index).unwrap(), state.block_length),
             )
         });
 
@@ -602,17 +638,12 @@ fn should_download(state: &mut State) -> bool {
     state.i_am_interested_in_peer && !state.peer_is_choking_me
 }
 
-async fn unhad_pieces(info_hash: &InfoHash, peer_pieces: &Pieces) -> Result<Pieces, Error> {
-    let pieces = PIECES.read().await;
-    let my_pieces = pieces.get(info_hash).ok_or(Error::NoPieces)?;
+async fn unhad_pieces(my_pieces: &Pieces, peer_pieces: &Pieces) -> Result<Pieces, Error> {
     Ok(right_but_not_left(my_pieces, peer_pieces))
 }
 
-async fn peer_has_pieces_we_want(
-    info_hash: &InfoHash,
-    peer_pieces: &Pieces,
-) -> Result<bool, Error> {
-    Ok(unhad_pieces(info_hash, peer_pieces).await?.any())
+async fn peer_has_pieces_we_want(my_pieces: &Pieces, peer_pieces: &Pieces) -> Result<bool, Error> {
+    Ok(unhad_pieces(my_pieces, peer_pieces).await?.any())
 }
 
 #[derive(Debug)]
