@@ -10,6 +10,10 @@
 //       and so they're leaking internal implementation information.
 //       figure out how to use thiserror to roll up multiple internal errors into a
 //       single opaque error.
+// - [ ] get rid of global statics, make everything live within a Client type or something like that,
+//       this cleans up the resource usage of this library,
+//       and it allows for starting multiple instances of the library in the same process for,
+//       e.g., testing
 
 use base64::Engine;
 use bencode::Bencode;

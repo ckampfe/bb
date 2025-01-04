@@ -74,6 +74,12 @@ pub enum AllToTorrentMessage {
     GetDataLocation {
         reply_tx: tokio::sync::oneshot::Sender<Result<PathBuf, Error>>,
     },
+    PeerUploadedToUs {
+        peer_id: PeerId,
+    },
+    PeerDownloadedFromUs {
+        peer_id: PeerId,
+    },
 }
 
 /// used in 2 scenarios:
@@ -137,8 +143,8 @@ enum TorrentState {
 /// stats for a single peer
 #[derive(Debug)]
 struct PeerStats {
-    downloaded: usize,
-    uploaded: usize,
+    blocks_uploaded_to_us: usize,
+    blocks_downloaded_from_us: usize,
 }
 
 #[derive(Debug)]
@@ -362,6 +368,14 @@ fn torrent_loop(
                         AllToTorrentMessage::GetDataLocation { reply_tx } => {
                             let _ = reply_tx.send(Ok(state.data_path.clone()));
                         }
+                        AllToTorrentMessage::PeerUploadedToUs { peer_id } => {
+                            let stats = state.peer_stats.entry(peer_id).or_insert(PeerStats { blocks_uploaded_to_us: 0, blocks_downloaded_from_us: 0 });
+                            stats.blocks_uploaded_to_us += 1;
+                        }
+                        AllToTorrentMessage::PeerDownloadedFromUs { peer_id } => {
+                            let stats = state.peer_stats.entry(peer_id).or_insert(PeerStats { blocks_uploaded_to_us: 0, blocks_downloaded_from_us: 0 });
+                            stats.blocks_downloaded_from_us += 1;
+                        }
                     }
                 }
                 _ = peer_connect_timer.tick() => {
@@ -382,6 +396,7 @@ fn torrent_loop(
                 }
                 _ = choke_timer.tick() => {
                     println!("choke timer tick");
+                    state.handle_choke_timer().await;
                 }
             }
         }
@@ -393,6 +408,13 @@ fn torrent_loop(
 }
 
 impl State {
+    async fn handle_choke_timer(&mut self) {
+        // TODO actually assess peer stats and do something about it
+        // do work here to assess and unchoke
+        // 1. unchoke 4 peers with best ratio that are interested.
+        // and reset.
+        self.peer_stats.clear();
+    }
     /// look at the peers we are currently connected to,
     /// look at what peers we have available,
     /// make some determination about what peers we should connect to,
