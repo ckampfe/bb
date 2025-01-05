@@ -1,5 +1,6 @@
 use crate::torrent::{self, TorrentHandle};
-use crate::{Error, InfoHash};
+use crate::{peer, Error, InfoHash, Port};
+use rand::Rng;
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
@@ -10,12 +11,14 @@ use tracing::debug;
 
 /// global options
 pub struct Options {
+    pub listen_port: Port,
     pub max_connections: usize,
 }
 
 impl Default for Options {
     fn default() -> Self {
         Self {
+            listen_port: Port::Port(6881),
             max_connections: 200,
         }
     }
@@ -24,21 +27,87 @@ impl Default for Options {
 // should this be one pointer to an inner struct?
 #[derive(Clone)]
 pub struct Client {
+    /// the way to access torrents to issue them commands
     torrents: Arc<RwLock<BTreeMap<InfoHash, TorrentHandle>>>,
+    /// the maximum number of connections the client will allow
     global_max_connections: Arc<tokio::sync::Semaphore>,
+    /// after issuing the cancellation token,
+    /// the task tracker gives us a future we can await
+    /// to know when tasks are completely shut down
+    task_tracker: TaskTracker,
     /// every subtask spawned for either a torrent or a peer connection
     /// receives this cancellation token,
     /// which is run when the client is dropped.
-    task_tracker: TaskTracker,
     cancellation_token: CancellationToken,
 }
 
 impl Client {
     pub fn new(options: Options) -> Self {
+        let task_tracker = TaskTracker::new();
+
+        let port = match options.listen_port {
+            Port::Port(p) => p,
+            Port::Random => rand::thread_rng().gen(),
+        };
+
+        let torrents: Arc<RwLock<BTreeMap<InfoHash, TorrentHandle>>> =
+            Arc::new(RwLock::new(BTreeMap::new()));
+
+        let torrents_for_listener = Arc::clone(&torrents);
+
+        let task_tracker_for_listener = task_tracker.clone();
+
+        task_tracker.spawn(async move {
+            let torrents = torrents_for_listener;
+
+            let task_tracker = task_tracker_for_listener;
+
+            let listener = tokio::net::TcpListener::bind(("::1", port)).await.unwrap();
+
+            loop {
+                let (mut socket, _addr) = listener.accept().await.unwrap();
+
+                debug!(
+                    "accepted connection from {:?}",
+                    socket.peer_addr().unwrap().ip()
+                );
+
+                let torrents_for_prospective_peer = Arc::clone(&torrents);
+
+                task_tracker.spawn(async move {
+                    let torrents = torrents_for_prospective_peer;
+
+                    let handshake_frame = peer::receive_handshake(&mut socket).await.unwrap();
+
+                    debug!(
+                        "received handshake from incoming peer {:?}",
+                        handshake_frame.peer_id
+                    );
+
+                    let torrents = torrents.read().await;
+
+                    if let Some(torrent) = torrents.get(&handshake_frame.info_hash) {
+                        let peer_args = torrent.get_peer_args().await.unwrap();
+
+                        let peer_handle =
+                            peer::from_socket(socket, handshake_frame.peer_id, peer_args)
+                                .await
+                                .unwrap();
+
+                        debug!("got peer handle for {:?}", peer_handle.remote_peer_id);
+
+                        torrent.add_incoming_peer(peer_handle).await.unwrap();
+
+                        debug!("added incoming peer to torrent")
+                    }
+                });
+            }
+        });
+
         Self {
-            torrents: Arc::new(RwLock::new(BTreeMap::new())),
+            torrents,
             global_max_connections: Arc::new(tokio::sync::Semaphore::new(options.max_connections)),
-            task_tracker: TaskTracker::new(),
+            task_tracker,
             cancellation_token: CancellationToken::new(),
         }
     }

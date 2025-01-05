@@ -54,6 +54,17 @@ impl Debug for PeerId {
     }
 }
 
+pub enum Port {
+    Port(u16),
+    Random,
+}
+
+impl From<u16> for Port {
+    fn from(value: u16) -> Self {
+        Port::Port(value)
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum Error {
     #[error("torrent error")]

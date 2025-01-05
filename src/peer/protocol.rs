@@ -23,7 +23,7 @@ const FRAME_RECEIVE_MAX: usize = 8 * ONE_MB;
 
 #[derive(Debug)]
 #[cfg_attr(test, derive(PartialEq))]
-pub(super) struct HandshakeFrame {
+pub(crate) struct HandshakeFrame {
     pub info_hash: InfoHash,
     pub peer_id: PeerId,
     /// todo make these real named fields at some point

@@ -1,7 +1,7 @@
 use crate::bencode::{self, Bencode};
 use crate::metainfo::MetaInfo;
 use crate::peer::{self, PeerHandle};
-use crate::{timeout, InfoHash, PeerId};
+use crate::{download, timeout, InfoHash, PeerId, Port};
 use bitvec::prelude::*;
 use bitvec::vec::BitVec;
 use rand::Rng;
@@ -70,6 +70,25 @@ pub enum AllToTorrentMessage {
     PeerDownloadedFromUs {
         peer_id: PeerId,
     },
+    GetPeerArgs {
+        reply_tx: oneshot::Sender<PeerArgs>,
+    },
+    AddIncomingPeer { peer_handle: PeerHandle }
+}
+
+pub(crate) struct PeerArgs {
+    pub pieces: Arc<RwLock<Pieces>>,
+    pub info_hash: InfoHash,
+    pub metainfo: Arc<MetaInfo>,
+    pub p2p_tx: broadcast::Sender<AllToAllMessage>,
+    pub p2p_rx: broadcast::Receiver<AllToAllMessage>,
+    pub my_id: PeerId,
+    pub data_path: PathBuf,
+    pub torrent_tx: mpsc::Sender<AllToTorrentMessage>,
+    pub task_tracker: TaskTracker,
+    pub cancellation_token: CancellationToken,
+    pub max_torrent_connections: Arc<Semaphore>,
+    pub global_max_connections: Arc<Semaphore>,
 }
 
 /// used in 2 scenarios:
@@ -175,11 +194,6 @@ impl Default for Options {
     }
 }
 
-enum Port {
-    Port(u16),
-    Random,
-}
-
 pub(crate) async fn new<P: AsRef<Path>>(
     dot_torrent_path: P,
     data_path: P,
@@ -200,11 +214,6 @@ pub(crate) async fn new<P: AsRef<Path>>(
     let number_of_pieces = usize::try_from(metainfo.number_of_pieces()).unwrap();
     // TODO actually calculate the number of bytes left
     let left_bytes = metainfo.length();
-
-    // {
-    //     let mut metainfos = crate::METAINFOS.write().await;
-    //     metainfos.insert(info_hash, metainfo);
-    // }
 
     let dot_torrent_path = dot_torrent_path.as_ref().to_path_buf();
     let data_path = data_path.as_ref().to_path_buf();
@@ -276,12 +285,6 @@ fn torrent_loop(
         let mut announce_timer = tokio::time::interval(std::time::Duration::from_secs(300));
         let mut peer_connect_timer = tokio::time::interval(std::time::Duration::from_secs(15));
 
-        // {
-        //     let mut pieces = PIECES.write().await;
-        //     pieces.insert(info_hash, bitvec![u8, Msb0; 0; number_of_pieces]);
-        // }
-
-
         let mut state = State {
             info_hash,
             metainfo: Arc::new(metainfo),
@@ -304,9 +307,12 @@ fn torrent_loop(
             tracker_state: TrackerState::Started,
             torrent_tx,
             p2p_tx,
-            task_tracker: task_tracker_clone,
-            cancellation_token
+            task_tracker: task_tracker_clone.clone(),
+            cancellation_token: cancellation_token.clone()
         };
+
+        let res = state.verify_local_data().await;
+        dbg!(res);
 
         loop {
             select! {
@@ -342,6 +348,25 @@ fn torrent_loop(
                 m = torrent_rx.recv() => {
                     let m = m.unwrap();
                     match m {
+                        AllToTorrentMessage::AddIncomingPeer { peer_handle } => {
+                            state.connected_peers.push(peer_handle);
+                        }
+                        AllToTorrentMessage::GetPeerArgs { reply_tx } => {
+                            let _ = reply_tx.send(PeerArgs { 
+                                pieces: Arc::clone(&state.pieces),
+                                info_hash,
+                                metainfo: Arc::clone(&state.metainfo),
+                                p2p_rx: state.p2p_tx.subscribe(),
+                                p2p_tx: state.p2p_tx.clone(),
+                                my_id: state.my_id,
+                                data_path: state.data_path.clone(),
+                                torrent_tx: state.torrent_tx.clone(),
+                                task_tracker: task_tracker_clone.clone(),
+                                cancellation_token: state.cancellation_token.clone(),
+                                max_torrent_connections: Arc::clone(&state.max_peer_connections),
+                                global_max_connections: Arc::clone(&state.global_max_connections)
+                            });
+                        }
                         AllToTorrentMessage::GetState { reply_tx } => {
                             let _ = reply_tx.send(Ok(format!("{:?}", state)));
                         }
@@ -430,6 +455,11 @@ impl State {
         // 1. unchoke 4 peers with best ratio that are interested.
         // and reset.
         self.peer_stats.clear();
+
+
+        for peer in self.connected_peers.iter().take(4) {
+            peer.unchoke().await;
+        }
     }
     /// look at the peers we are currently connected to,
     /// look at what peers we have available,
@@ -641,34 +671,16 @@ impl State {
     }
 
     async fn verify_local_data(&mut self) -> Result<(), Error> {
-        // let piece_length = {
-        //     if let Some(metainfo) = METAINFOS.read().await.get(&self.info_hash) {
-        //         usize::try_from(metainfo.piece_length()).unwrap()
-        //     } else {
-        //         return Err(Error::NoMetainfo);
-        //     }
-        // };
         let piece_length = usize::try_from(self.metainfo.piece_length()).unwrap();
 
-        let mut f = tokio::fs::File::open(&self.data_path).await?;
+        let mut to_read = self.data_path.clone();
+        to_read.push(self.metainfo.name());
+        let mut f = tokio::fs::File::open(to_read).await?;
+        debug!("here1");
         // TODO parallelize
 
-        // let length = {
-        //     if let Some(metainfo) = METAINFOS.read().await.get(&self.info_hash) {
-        //         metainfo.length()
-        //     } else {
-        //         return Err(Error::NoMetainfo);
-        //     }
-        // };
         let length = self.metainfo.length();
 
-        // let number_of_pieces = {
-        //     if let Some(metainfo) = METAINFOS.read().await.get(&self.info_hash) {
-        //         usize::try_from(metainfo.number_of_pieces()).unwrap()
-        //     } else {
-        //         return Err(Error::NoMetainfo);
-        //     }
-        // };
         let number_of_pieces = usize::try_from(self.metainfo.number_of_pieces()).unwrap();
 
         let nominal_length = number_of_pieces * piece_length;
@@ -679,40 +691,42 @@ impl State {
         let mut normal_piece_buf = vec![0u8; piece_length];
         let mut last_piece_buf = vec![0u8; last_piece_length];
 
-        // if let Some(metainfo) = METAINFOS.read().await.get(&self.info_hash) {
         let piece_hashes = self.metainfo.piece_hashes_iter();
 
         for (i, piece_hash) in piece_hashes.enumerate() {
+            debug!("here3");
             f.seek(std::io::SeekFrom::Start(
                 u64::try_from(piece_length * i).unwrap(),
             ))
             .await?;
 
-            let have_piece = if i == number_of_pieces - 1 {
-                f.read_exact(&mut last_piece_buf).await?;
-                &crate::hash(&last_piece_buf) == piece_hash
-            } else {
-                f.read_exact(&mut normal_piece_buf).await?;
-                &crate::hash(&normal_piece_buf) == piece_hash
-            };
+
+            // let have_piece = if i == number_of_pieces - 1 {
+            //     debug!("here5");
+            //     f.read_exact(&mut last_piece_buf).await?;
+            //     &crate::hash(&last_piece_buf) == piece_hash
+            // } else {
+            //     debug!("here4");
+            //     f.read_exact(&mut normal_piece_buf).await?;
+            //     &crate::hash(&normal_piece_buf) == piece_hash
+            // };
+            let have_piece = download::verify_piece(&self.metainfo, &mut f, i.try_into().unwrap()).await?;
+            dbg!(i);
+            dbg!(have_piece);
 
             if have_piece {
-                // let mut pieces = PIECES.write().await;
                 let mut my_pieces = self.pieces.write().await;
-                // let my_pieces = pieces.get_mut(&self.info_hash).ok_or(Error::NoPieces)?;
                 my_pieces.set(i, true);
             } else {
-                // let mut pieces = PIECES.write().await;
                 let mut my_pieces = self.pieces.write().await;
-                // let my_pieces = pieces.get_mut(&self.info_hash).ok_or(Error::NoPieces)?;
                 my_pieces.set(i, false);
             }
         }
-        // }
+        debug!("here2");
 
-        // let pieces = PIECES.read().await;
-        // let my_pieces = pieces.get(&self.info_hash).ok_or(Error::NoPieces)?;
         let my_pieces = self.pieces.read().await;
+        let have = my_pieces.count_ones();
+        let not_have = my_pieces.count_zeros();
 
         if my_pieces.all() {
             self.state = TorrentState::Seeding;
@@ -720,6 +734,9 @@ impl State {
             // and we don't need to do it again
             self.tracker_state = TrackerState::Started;
         }
+
+        debug!("verified local data, have: {}, not have: {}", have, not_have);
+
 
         Ok(())
     }
@@ -740,6 +757,14 @@ pub(crate) struct TorrentHandle {
 }
 
 impl TorrentHandle {
+    pub(crate) async fn get_peer_args(&self) -> Result<PeerArgs, Error> {
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        self.tx
+            .send(AllToTorrentMessage::GetPeerArgs { reply_tx })
+            .await?;
+        Ok(timeout!(reply_rx, 5).await??)
+    }
+
     /// The state of the torrent, dumped as a `Debug` string.
     pub(crate) async fn get_state_debug_string(&self) -> Result<String, Error> {
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
@@ -775,6 +800,11 @@ impl TorrentHandle {
         )
         .await??;
         timeout!(reply_rx, 5).await??
+    }
+    
+    pub(crate) async fn add_incoming_peer(&self, peer_handle: PeerHandle) -> Result<(), Error> {
+        timeout!(self.tx.send(AllToTorrentMessage::AddIncomingPeer { peer_handle }), 5).await??;
+        Ok(())
     }
 }
 

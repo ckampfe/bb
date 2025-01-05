@@ -1,5 +1,5 @@
 use crate::metainfo::MetaInfo;
-use crate::torrent::{self, AllToAllMessage, Pieces};
+use crate::torrent::{self, AllToAllMessage, PeerArgs, Pieces};
 use crate::{download, timeout, InfoHash, PeerId};
 use bitvec::{bitvec, order::Msb0};
 use futures::sink::SinkExt;
@@ -11,7 +11,6 @@ use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
-use tokio::net::TcpStream;
 use tokio::sync::{broadcast, mpsc, RwLock, Semaphore, TryAcquireError};
 use tokio::time::interval;
 use tokio::{select, task::JoinHandle, time::error::Elapsed};
@@ -48,6 +47,8 @@ pub(crate) enum Error {
 }
 
 pub enum TorrentToPeer {
+    Choke,
+    Unchoke,
     Shutdown,
 }
 
@@ -146,6 +147,58 @@ struct State {
     peer_is_interested_in_me: bool,
 }
 
+pub(crate) async fn from_socket(
+    socket: tokio::net::TcpStream,
+    remote_peer_id: PeerId,
+    peer_args: PeerArgs,
+) -> Result<PeerHandle, Error> {
+    let global_permit = peer_args.global_max_connections.try_acquire_owned()?;
+    debug!("got global permit");
+    let torrent_permit = peer_args.max_torrent_connections.try_acquire_owned()?;
+    debug!("got torrent permit");
+
+    let ip = socket.peer_addr().unwrap().ip();
+    let (socket_rx, mut socket_tx) = socket.into_split();
+    let reader = FramedRead::new(socket_rx, protocol::PeerProtocol::new());
+    let mut writer = FramedWrite::new(&mut socket_tx, protocol::HandshakeProtocol::new());
+
+    timeout!(
+        writer.send(HandshakeFrame::new(
+            peer_args.info_hash,
+            peer_args.my_id,
+            [0; 8]
+        )),
+        15
+    )
+    .await??;
+    debug!("sent handshake");
+
+    let writer = FramedWrite::new(socket_tx, protocol::PeerProtocol::new());
+
+    dbg!(&peer_args.pieces);
+
+    let peer_handle = peer_loop(
+        peer_args.pieces,
+        peer_args.info_hash,
+        peer_args.metainfo,
+        peer_args.p2p_tx,
+        peer_args.p2p_rx,
+        &peer_args.data_path,
+        peer_args.my_id,
+        remote_peer_id,
+        reader,
+        writer,
+        ip,
+        peer_args.torrent_tx,
+        peer_args.task_tracker,
+        peer_args.cancellation_token,
+        torrent_permit,
+        global_permit,
+    );
+
+    Ok(peer_handle)
+}
+
 /// an outgoing connection: the way we connect to a remote peer
 #[instrument(skip_all)]
 pub(crate) async fn new(
@@ -166,7 +219,6 @@ pub(crate) async fn new(
     global_max_connections: Arc<Semaphore>,
 ) -> Result<PeerHandle, Error> {
     debug!("peer new");
-    // let permit = crate::GLOBAL_MAX_CONNECTIONS.try_acquire()?;
     let global_permit = global_max_connections.try_acquire_owned()?;
     debug!("got global permit");
     let torrent_permit = max_torrent_connections.try_acquire_owned()?;
@@ -205,11 +257,6 @@ pub(crate) async fn new(
     Ok(peer_handle)
 }
 
-/// an incoming connection: the way a remote peer connects to us
-pub(crate) async fn accept_peer_connection(socket: TcpStream) -> Result<PeerHandle, Error> {
-    todo!()
-}
-
 /// the peer's main processing loop
 #[instrument(skip_all)]
 fn peer_loop(
@@ -240,13 +287,6 @@ fn peer_loop(
         let _global_permit = global_permit;
         let _torrent_permit = torrent_permit;
 
-        // send the initial bitfield, we do not treat this as part of the handshake
-        // {
-        //     let pieces = PIECES.read().await;
-        //     let my_pieces = pieces.get(&info_hash).ok_or(Error::NoPieces)?;
-        //     timeout!(writer.send(Frame::Bitfield { pieces: my_pieces.to_owned() }), 5).await??;
-        //     debug!("sent bitfield")
-        // }
         {
             let my_pieces = my_pieces.read().await;
             timeout!(writer.send(Frame::Bitfield { pieces: my_pieces.to_owned() }), 5).await??;
@@ -259,10 +299,6 @@ fn peer_loop(
         let mut requests_timer = interval(Duration::from_secs(1));
         requests_timer.reset();
 
-        // let pieces_length =  {
-        //     let pieces = PIECES.read().await;
-        //     pieces.get(&info_hash).map(|pieces| pieces.len()).ok_or(Error::NoPieces)?
-        // };
         let pieces_length = {
             my_pieces.read().await.len()
         };
@@ -287,6 +323,7 @@ fn peer_loop(
             peer_is_interested_in_me: false,
         };
 
+        debug!("enterint peer loop for real");
         loop {
             select! {
                 _ = state.cancellation_token.cancelled() => {
@@ -370,6 +407,14 @@ fn peer_loop(
                         None => break,
                         Some(m) => {
                             match m {
+                                TorrentToPeer::Choke => {
+                                    state.i_am_choking_peer = true;
+                                    state.writer.send(Frame::Choke).await?;
+                                }
+                                TorrentToPeer::Unchoke => {
+                                    state.i_am_choking_peer = false;
+                                    state.writer.send(Frame::Unchoke).await?;
+                                }
                                 TorrentToPeer::Shutdown => {
                                     debug!("peer received shutdown, shutting down");
                                     break
@@ -549,6 +594,19 @@ async fn handle_cancel(
     Ok(())
 }
 
+pub(crate) async fn receive_handshake(
+    socket: &mut tokio::net::TcpStream,
+) -> Result<HandshakeFrame, Error> {
+    let mut reader = FramedRead::new(socket, protocol::HandshakeProtocol::new());
+
+    let handshake_frame = timeout!(reader.next(), 15)
+        .await?
+        .ok_or(Error::ConnectionClosed)??;
+    debug!("received handshake, verifying");
+
+    Ok(handshake_frame)
+}
+
 #[instrument(skip(socket))]
 async fn handshake_peer(
     socket: &mut tokio::net::TcpStream,
@@ -658,6 +716,11 @@ impl PeerHandle {
     #[instrument]
     pub(crate) async fn shutdown(&self) {
         if let Err(_elapsed) = timeout!(self.peer_tx.send(TorrentToPeer::Shutdown), 5).await {
+            self.task_handle.abort();
+        }
+    }
+    pub(crate) async fn unchoke(&self) {
+        if let Err(_elapsed) = timeout!(self.peer_tx.send(TorrentToPeer::Unchoke), 5).await {
             self.task_handle.abort();
         }
     }
