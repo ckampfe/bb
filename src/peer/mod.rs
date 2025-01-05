@@ -1,5 +1,5 @@
 use crate::metainfo::MetaInfo;
-use crate::torrent::{self, AllToAllMessage, PeerArgs, Pieces};
+use crate::torrent::{self, GossipMessage, PeerArgs, Pieces};
 use crate::{download, timeout, InfoHash, PeerId};
 use bitvec::{bitvec, order::Msb0};
 use futures::sink::SinkExt;
@@ -41,7 +41,7 @@ pub(crate) enum Error {
     #[error("no metainfo available")]
     Metainfo,
     #[error("unable to broadcast to other peers")]
-    P2PBroadcast(#[from] tokio::sync::broadcast::error::SendError<AllToAllMessage>),
+    P2PBroadcast(#[from] tokio::sync::broadcast::error::SendError<GossipMessage>),
     #[error("unable to get pieces for this torrent")]
     NoPieces,
 }
@@ -122,7 +122,7 @@ struct State {
     info_hash: InfoHash,
     metainfo: Arc<MetaInfo>,
     /// used to communicate status information to other peer tasks
-    gossip_tx: broadcast::Sender<AllToAllMessage>,
+    gossip_tx: broadcast::Sender<GossipMessage>,
     /// where the downloaded data lives
     // TODO make this updatable by the torrent task
     data_path: PathBuf,
@@ -203,8 +203,8 @@ pub(crate) async fn from_socket(
 #[instrument(skip_all)]
 pub(crate) async fn new(
     pieces: Arc<RwLock<Pieces>>,
-    gossip_tx: broadcast::Sender<AllToAllMessage>,
-    gossip_rx: broadcast::Receiver<AllToAllMessage>,
+    gossip_tx: broadcast::Sender<GossipMessage>,
+    gossip_rx: broadcast::Receiver<GossipMessage>,
     data_path: &Path,
     ip: IpAddr,
     port: u16,
@@ -263,8 +263,8 @@ fn peer_loop(
     my_pieces: Arc<RwLock<Pieces>>,
     info_hash: InfoHash,
     metainfo: Arc<MetaInfo>,
-    gossip_tx: broadcast::Sender<AllToAllMessage>,
-    mut gossip_rx: broadcast::Receiver<AllToAllMessage>,
+    gossip_tx: broadcast::Sender<GossipMessage>,
+    mut gossip_rx: broadcast::Receiver<GossipMessage>,
     data_path: &Path,
     my_id: PeerId,
     remote_peer_id: PeerId,
@@ -335,12 +335,13 @@ fn peer_loop(
                 }
                 Ok(m) = gossip_rx.recv() => {
                     match m {
-                        AllToAllMessage::WeHave { index } => {
+                        GossipMessage::WeHave { index } => {
                             state.writer.send(Frame::Have { index }).await?;
                             debug!("told remote peer that I have {}", index);
                         },
-                        AllToAllMessage::DownloadComplete => {
+                        GossipMessage::DownloadComplete => {
                             state.i_am_interested_in_peer = false;
+                            state.writer.send(Frame::NotInterested).await?;
                         }
                     }
                 }
@@ -577,7 +578,7 @@ async fn handle_piece(
         let mut my_pieces = timeout!(state.my_pieces.write(), 2).await?;
         my_pieces.set(index as usize, true);
         debug!("piece verified");
-        state.gossip_tx.send(AllToAllMessage::WeHave { index })?;
+        state.gossip_tx.send(GossipMessage::WeHave { index })?;
     } else {
         debug!("piece did not verify");
     }

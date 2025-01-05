@@ -46,7 +46,7 @@ pub enum Error {
     #[error("unable to get pieces for this torrent")]
     NoPieces,
     #[error("ldfjdf")]
-    InternalBroadcast(#[from] broadcast::error::SendError<AllToAllMessage>),
+    InternalBroadcast(#[from] broadcast::error::SendError<GossipMessage>),
 }
 
 /// used to send messages to the torrent only
@@ -80,8 +80,8 @@ pub(crate) struct PeerArgs {
     pub pieces: Arc<RwLock<Pieces>>,
     pub info_hash: InfoHash,
     pub metainfo: Arc<MetaInfo>,
-    pub gossip_tx: broadcast::Sender<AllToAllMessage>,
-    pub gossip_rx: broadcast::Receiver<AllToAllMessage>,
+    pub gossip_tx: broadcast::Sender<GossipMessage>,
+    pub gossip_rx: broadcast::Receiver<GossipMessage>,
     pub my_id: PeerId,
     pub data_path: PathBuf,
     pub torrent_tx: mpsc::Sender<AllToTorrentMessage>,
@@ -93,9 +93,9 @@ pub(crate) struct PeerArgs {
 
 /// used in 2 scenarios:
 /// - torrent to send message to all peers
-/// - peer to send message to all other peers
+/// - peer to send message to all other peers AND to torrent
 #[derive(Clone, Copy, Debug)]
-pub enum AllToAllMessage {
+pub enum GossipMessage {
     /// peers broadcast this message to let the other peers in the cluster know
     /// that they have a message.
     /// named this way to differentiate it from `Frame::Have`,
@@ -145,7 +145,7 @@ struct State {
     max_peer_connections: Arc<Semaphore>,
     global_max_connections: Arc<Semaphore>,
     torrent_tx: mpsc::Sender<AllToTorrentMessage>,
-    gossip_tx: broadcast::Sender<AllToAllMessage>,
+    gossip_tx: broadcast::Sender<GossipMessage>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -325,14 +325,14 @@ fn torrent_loop(
                         // check if we are done.
                         // peers update the pieces directly,
                         // so we don't have to set them here.
-                        AllToAllMessage::WeHave { .. } => {
+                        GossipMessage::WeHave { .. } => {
                             let my_pieces = state.pieces.read().await;
 
                             if my_pieces.all() {
                                 // we are done!
                                 info!("download complete {:?}", info_hash);
 
-                                state.gossip_tx.send(AllToAllMessage::DownloadComplete)?;
+                                state.gossip_tx.send(GossipMessage::DownloadComplete)?;
 
                                 state.state = TorrentState::Seeding;
                                 state.tracker_state = TrackerState::Completed;
@@ -340,7 +340,7 @@ fn torrent_loop(
                                 state.announce().await?;
                             }
                         },
-                        AllToAllMessage::DownloadComplete => {}
+                        GossipMessage::DownloadComplete => {}
                     }
                 }
                 m = torrent_rx.recv() => {
