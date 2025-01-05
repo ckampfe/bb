@@ -106,14 +106,17 @@ pub enum GossipMessage {
     DownloadComplete,
 }
 
+/// the state of a single running torrent
 #[derive(Debug)]
 struct State {
     /// the channel to communicate to the runtime itself, if need be
-    // rt_tx: tokio::sync::mpsc::Sender<runtime::Message>,
     info_hash: InfoHash,
     /// location of the .torrent
     dot_torrent_path: PathBuf,
     metainfo: Arc<MetaInfo>,
+    /// the current progress of the torrent, which pieces we have and don't have.
+    /// all peers receive a clone of this Arc, and update it themselves
+    /// as they download pieces
     pieces: Arc<RwLock<Pieces>>,
     /// download location
     data_path: PathBuf,
@@ -124,27 +127,40 @@ struct State {
     /// peers, as we get them from the tracker
     /// a hashet ensures that we only ever have one entry per unique peer
     available_peers: HashSet<AvailablePeer>,
+    /// how much each individual peer has uploaded and downloaded
+    /// TODO actually use this for the choke algorithm
     peer_stats: BTreeMap<PeerId, PeerStats>,
     /// the last announce we've received from the tracker
     last_announce: Option<Bencode>,
-    // ("peer_id", self.peer_id),
+    /// our unique id. TODO is this unique per torrent or per client?
     my_id: PeerId,
-    // ("port", self.port),
+    /// the port we are listening on
+    /// TODO why do we store this here instead of getting it from the client?
     port: u16,
-    // ("left", self.left),
+    /// the number of bytes remaining to download for this torrent to be complete
     left_bytes: u64,
-    // ("uploaded", self.uploaded),
+    /// the number of bytes we have uploaded over the course of this torrent's life.
+    /// TODO figure out some way to track this persistently
     uploaded_bytes: u64,
-    // ("downloaded", self.downloaded),
+    /// the number of bytes we have downloaded over the course of this torrent's life.
+    /// TODO figure out some way to track this persistently
     downloaded_bytes: u64,
-    // ("event", self.state),
+    /// the logical state we are in, whether we are seeding or leaching or something else
     state: TorrentState,
+    /// the state we report to the tracker
     tracker_state: TrackerState,
+    /// used to spawn and ensure all peer tasks for this torrent properly shut down
+    /// when commanded to do so
     task_tracker: TaskTracker,
+    /// used to command peer tasks to shut down
     cancellation_token: CancellationToken,
+    /// the number of max connections allowed within the context of this torrent only
     max_peer_connections: Arc<Semaphore>,
+    /// the global number of connections allowed across the entire client
     global_max_connections: Arc<Semaphore>,
+    /// the way that a peer or client can send a message to this torrent task
     torrent_tx: mpsc::Sender<AllToTorrentMessage>,
+    /// the way that the peers and torrent communicate with each other. omnidirectional.
     gossip_tx: broadcast::Sender<GossipMessage>,
 }
 
