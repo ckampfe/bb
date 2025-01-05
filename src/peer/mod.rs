@@ -89,7 +89,7 @@ impl<T: PartialEq> AsyncQueue<T> {
     /// either enqueues the item or returns immediately
     /// if there is no remaining capacity.
     /// returns `true` if the item was enqueued, `false` if not.
-    async fn try_push_back(&mut self, item: T) -> bool {
+    fn try_push_back(&mut self, item: T) -> bool {
         if self.q.len() < self.capacity {
             self.q.push_back(item);
             true
@@ -105,12 +105,12 @@ impl<T: PartialEq> AsyncQueue<T> {
     }
 
     /// remove all items from the queue
-    async fn clear(&mut self) {
+    fn clear(&mut self) {
         self.q.clear();
     }
 
     /// keep items for which `predicate` returns true
-    async fn filter<P: FnMut(&T) -> bool>(&mut self, predicate: P) {
+    fn filter<P: FnMut(&T) -> bool>(&mut self, predicate: P) {
         let q_moved_out = std::mem::take(&mut self.q);
         self.q = q_moved_out.into_iter().filter(predicate).collect();
     }
@@ -405,7 +405,7 @@ fn right_but_not_left(left: &Pieces, right: &Pieces) -> Pieces {
 #[instrument(skip_all)]
 async fn handle_choke(state: &mut State) -> Result<(), Error> {
     state.peer_is_choking_me = true;
-    state.requests_queue.clear().await;
+    state.requests_queue.clear();
     Ok(())
 }
 
@@ -544,10 +544,7 @@ async fn handle_cancel(
         length,
     };
 
-    state
-        .requests_queue
-        .filter(|request| request != &to_remove)
-        .await;
+    state.requests_queue.filter(|request| request != &to_remove);
 
     Ok(())
 }
@@ -624,7 +621,7 @@ async fn maybe_enqueue_requests(state: &mut State) -> Result<(), Error> {
                 debug!("enqueing request {:?} to download", request);
 
                 // once we are out of capacity, break out of the loop
-                if !state.requests_queue.try_push_back(request).await {
+                if !state.requests_queue.try_push_back(request) {
                     break 'outer;
                 };
             }
