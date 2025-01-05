@@ -80,8 +80,8 @@ pub(crate) struct PeerArgs {
     pub pieces: Arc<RwLock<Pieces>>,
     pub info_hash: InfoHash,
     pub metainfo: Arc<MetaInfo>,
-    pub p2p_tx: broadcast::Sender<AllToAllMessage>,
-    pub p2p_rx: broadcast::Receiver<AllToAllMessage>,
+    pub gossip_tx: broadcast::Sender<AllToAllMessage>,
+    pub gossip_rx: broadcast::Receiver<AllToAllMessage>,
     pub my_id: PeerId,
     pub data_path: PathBuf,
     pub torrent_tx: mpsc::Sender<AllToTorrentMessage>,
@@ -145,7 +145,7 @@ struct State {
     max_peer_connections: Arc<Semaphore>,
     global_max_connections: Arc<Semaphore>,
     torrent_tx: mpsc::Sender<AllToTorrentMessage>,
-    p2p_tx: broadcast::Sender<AllToAllMessage>,
+    gossip_tx: broadcast::Sender<AllToAllMessage>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -276,7 +276,7 @@ fn torrent_loop(
 
     let tx = torrent_tx.clone();
 
-    let (p2p_tx, mut p2p_rx) = broadcast::channel(20);
+    let (gossip_tx, mut gossip_rx) = broadcast::channel(20);
 
     let task_tracker_clone = task_tracker.clone();
 
@@ -306,13 +306,12 @@ fn torrent_loop(
             state: TorrentState::Leaching,
             tracker_state: TrackerState::Started,
             torrent_tx,
-            p2p_tx,
+            gossip_tx,
             task_tracker: task_tracker_clone.clone(),
             cancellation_token: cancellation_token.clone()
         };
 
-        let res = state.verify_local_data().await;
-        dbg!(res);
+        state.verify_local_data().await?;
 
         loop {
             select! {
@@ -320,21 +319,20 @@ fn torrent_loop(
                     debug!("{:?} shutting down torrent task", state.info_hash);
                     break
                 }
-                Ok(m) = p2p_rx.recv() => {
+                Ok(m) = gossip_rx.recv() => {
                     match m {
                         // every time a peer reports that we now have a new piece,
-                        // check if we are done
+                        // check if we are done.
+                        // peers update the pieces directly,
+                        // so we don't have to set them here.
                         AllToAllMessage::WeHave { .. } => {
-                            // let pieces = PIECES.read().await;
                             let my_pieces = state.pieces.read().await;
-
-                            // let my_pieces = pieces.get(&info_hash).ok_or(Error::NoPieces)?;
 
                             if my_pieces.all() {
                                 // we are done!
                                 info!("download complete {:?}", info_hash);
 
-                                state.p2p_tx.send(AllToAllMessage::DownloadComplete)?;
+                                state.gossip_tx.send(AllToAllMessage::DownloadComplete)?;
 
                                 state.state = TorrentState::Seeding;
                                 state.tracker_state = TrackerState::Completed;
@@ -356,8 +354,8 @@ fn torrent_loop(
                                 pieces: Arc::clone(&state.pieces),
                                 info_hash,
                                 metainfo: Arc::clone(&state.metainfo),
-                                p2p_rx: state.p2p_tx.subscribe(),
-                                p2p_tx: state.p2p_tx.clone(),
+                                gossip_rx: state.gossip_tx.subscribe(),
+                                gossip_tx: state.gossip_tx.clone(),
                                 my_id: state.my_id,
                                 data_path: state.data_path.clone(),
                                 torrent_tx: state.torrent_tx.clone(),
@@ -431,12 +429,12 @@ fn torrent_loop(
                             state.handle_announce(&mut announce_timer, response);
                         }
                         Err(e) => {
-                            println!("got error from tracker announce: {:#?}", e);
+                            debug!("got error from tracker announce: {:#?}", e);
                         }
                     };
                 }
                 _ = choke_timer.tick() => {
-                    println!("choke timer tick");
+                    debug!("choke timer tick");
                     state.handle_choke_timer().await;
                 }
             }
@@ -507,8 +505,8 @@ impl State {
                 debug!("connecting to peer {}, {:?}", peer.ip, peer.peer_id);
                 if let Ok(peer_handle) = peer::new(
                     Arc::clone(&self.pieces),
-                    self.p2p_tx.clone(),
-                    self.p2p_tx.subscribe(),
+                    self.gossip_tx.clone(),
+                    self.gossip_tx.subscribe(),
                     &self.data_path,
                     peer.ip,
                     peer.port,

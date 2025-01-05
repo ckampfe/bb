@@ -112,6 +112,7 @@ impl Client {
         }
     }
 
+    /// add and start a new torrent
     pub async fn new_torrent<P: AsRef<Path>>(
         &self,
         dot_torrent_path: P,

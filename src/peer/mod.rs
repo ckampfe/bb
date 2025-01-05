@@ -122,7 +122,7 @@ struct State {
     info_hash: InfoHash,
     metainfo: Arc<MetaInfo>,
     /// used to communicate status information to other peer tasks
-    p2p_tx: broadcast::Sender<AllToAllMessage>,
+    gossip_tx: broadcast::Sender<AllToAllMessage>,
     /// where the downloaded data lives
     // TODO make this updatable by the torrent task
     data_path: PathBuf,
@@ -181,8 +181,8 @@ pub(crate) async fn from_socket(
         peer_args.pieces,
         peer_args.info_hash,
         peer_args.metainfo,
-        peer_args.p2p_tx,
-        peer_args.p2p_rx,
+        peer_args.gossip_tx,
+        peer_args.gossip_rx,
         &peer_args.data_path,
         peer_args.my_id,
         remote_peer_id,
@@ -203,8 +203,8 @@ pub(crate) async fn from_socket(
 #[instrument(skip_all)]
 pub(crate) async fn new(
     pieces: Arc<RwLock<Pieces>>,
-    p2p_tx: broadcast::Sender<AllToAllMessage>,
-    p2p_rx: broadcast::Receiver<AllToAllMessage>,
+    gossip_tx: broadcast::Sender<AllToAllMessage>,
+    gossip_rx: broadcast::Receiver<AllToAllMessage>,
     data_path: &Path,
     ip: IpAddr,
     port: u16,
@@ -239,8 +239,8 @@ pub(crate) async fn new(
         pieces,
         info_hash,
         metainfo,
-        p2p_tx,
-        p2p_rx,
+        gossip_tx,
+        gossip_rx,
         data_path,
         my_id,
         handshake_frame.peer_id,
@@ -263,8 +263,8 @@ fn peer_loop(
     my_pieces: Arc<RwLock<Pieces>>,
     info_hash: InfoHash,
     metainfo: Arc<MetaInfo>,
-    p2p_tx: broadcast::Sender<AllToAllMessage>,
-    mut p2p_rx: broadcast::Receiver<AllToAllMessage>,
+    gossip_tx: broadcast::Sender<AllToAllMessage>,
+    mut gossip_rx: broadcast::Receiver<AllToAllMessage>,
     data_path: &Path,
     my_id: PeerId,
     remote_peer_id: PeerId,
@@ -293,18 +293,21 @@ fn peer_loop(
             debug!("sent bitfield")
         }
 
-        let mut timeout_timer = interval(Duration::from_secs(30));
-        timeout_timer.reset();
+        let mut keepalive_timer = interval(Duration::from_secs(30));
+        keepalive_timer.reset();
 
         let mut requests_timer = interval(Duration::from_secs(1));
         requests_timer.reset();
+
+        let mut inactivity_timer = interval(Duration::from_secs(120));
+        inactivity_timer.reset();
 
         let pieces_length = {
             my_pieces.read().await.len()
         };
 
         let mut state = State {
-            p2p_tx,
+            gossip_tx,
             metainfo,
             data_path,
             info_hash,
@@ -323,14 +326,14 @@ fn peer_loop(
             peer_is_interested_in_me: false,
         };
 
-        debug!("enterint peer loop for real");
+
         loop {
             select! {
                 _ = state.cancellation_token.cancelled() => {
                     debug!("{:?} shutting down peer connection task to {:?}", state.info_hash, remote_peer_id);
                     break;
                 }
-                Ok(m) = p2p_rx.recv() => {
+                Ok(m) = gossip_rx.recv() => {
                     match m {
                         AllToAllMessage::WeHave { index } => {
                             state.writer.send(Frame::Have { index }).await?;
@@ -390,6 +393,8 @@ fn peer_loop(
                                     handle_cancel(&mut state, index, begin, length).await?
                                 },
                             }
+
+                            inactivity_timer.reset();
                         }
                         Some(Err(e)) => {
                             debug!("got error reading from remote peer: {e}");
@@ -423,8 +428,12 @@ fn peer_loop(
                         }
                     }
                 }
-                _ = timeout_timer.tick() => {
+                _ = keepalive_timer.tick() => {
                     state.writer.send(Frame::Keepalive).await?;
+                }
+                _ = inactivity_timer.tick() => {
+                    debug!("did not receive any message from peer for 2 minutes, shutting down.");
+                    break
                 }
             }
         }
@@ -568,7 +577,7 @@ async fn handle_piece(
         let mut my_pieces = timeout!(state.my_pieces.write(), 2).await?;
         my_pieces.set(index as usize, true);
         debug!("piece verified");
-        state.p2p_tx.send(AllToAllMessage::WeHave { index })?;
+        state.gossip_tx.send(AllToAllMessage::WeHave { index })?;
     } else {
         debug!("piece did not verify");
     }
