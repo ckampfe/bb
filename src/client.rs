@@ -169,7 +169,9 @@ impl Drop for Client {
         // is this correct? is it safe? no idea
         std::thread::scope(|s| {
             s.spawn(|| {
-                let rt = tokio::runtime::Builder::new_multi_thread().build().unwrap();
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .build()
+                    .unwrap();
                 rt.block_on(self.task_tracker.wait());
                 debug!("task tracker done, all tasks are shutdown");
             });
