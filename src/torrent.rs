@@ -6,7 +6,7 @@ use bitvec::prelude::*;
 use bitvec::vec::BitVec;
 use rand::Rng;
 use std::borrow::Cow;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fmt::{Debug, Display};
 use std::net::IpAddr;
 use std::ops::ControlFlow;
@@ -104,6 +104,7 @@ pub enum GossipMessage {
         index: u32,
     },
     DownloadComplete,
+    Choke,
 }
 
 /// the state of a single running torrent
@@ -357,6 +358,7 @@ fn torrent_loop(
                             }
                         },
                         GossipMessage::DownloadComplete => {}
+                        GossipMessage::Choke => {}
                     }
                 }
                 m = torrent_rx.recv() => {
@@ -451,7 +453,7 @@ fn torrent_loop(
                 }
                 _ = choke_timer.tick() => {
                     debug!("choke timer tick");
-                    state.handle_choke_timer().await;
+                    state.handle_choke_timer().await?;
                 }
             }
         }
@@ -463,18 +465,54 @@ fn torrent_loop(
 }
 
 impl State {
-    async fn handle_choke_timer(&mut self) {
+    async fn handle_choke_timer(&mut self)-> Result<(), Error> {
         // TODO actually assess peer stats and do something about it
         // do work here to assess and unchoke
         // 1. unchoke 4 peers with best ratio that are interested.
         // and reset.
         self.peer_stats.clear();
 
+        // send choke signal to all peers.
+        // peers will only send the choke message to the remote peer
+        // if they need to.
+        // for peer in self.connected_peers.iter() {
+        //     peer.choke().await;
+        // }
+        self.gossip_tx.send(GossipMessage::Choke)?;
+        debug!("told all peers to be choked");
 
-        for peer in self.connected_peers.iter().take(4) {
+        let peers_to_unchoke = self.random_peers_to_unchoke(4);
+
+        for peer in peers_to_unchoke {
+            debug!("unchoking {:?}", peer.remote_peer_id);
             peer.unchoke().await;
         }
+
+        Ok(())
     }
+
+    // if peers.len() >= n, returns n peers,
+    // otherwise returns peers.len() peers
+    fn random_peers_to_unchoke(&self, n: usize) -> Vec<&PeerHandle> {
+        let mut peers = vec![];
+
+        let mut idxs = BTreeSet::new();
+
+        while idxs.len() < n && idxs.len() < self.connected_peers.len() {
+            let idx = rand::thread_rng().gen_range(0..self.connected_peers.len());
+            idxs.insert(idx);
+        }
+
+        for idx in idxs {
+            if let Some(peer) = self.connected_peers.get(idx) {
+                peers.push(peer);
+            };
+        }
+
+        peers
+    }
+
+
     /// look at the peers we are currently connected to,
     /// look at what peers we have available,
     /// make some determination about what peers we should connect to,

@@ -47,7 +47,6 @@ pub(crate) enum Error {
 }
 
 pub enum TorrentToPeer {
-    Choke,
     Unchoke,
     Shutdown,
 }
@@ -280,7 +279,7 @@ fn peer_loop(
     debug!("entered peer loop fn");
     let data_path = data_path.to_path_buf();
 
-    let (peer_tx, mut peer_rx) = mpsc::channel(10);
+    let (peer_tx, mut peer_rx) = mpsc::channel(5);
 
     let task_handle = task_tracker.spawn(async move {
         debug!("entered peer loop task");
@@ -342,6 +341,12 @@ fn peer_loop(
                         GossipMessage::DownloadComplete => {
                             state.i_am_interested_in_peer = false;
                             state.writer.send(Frame::NotInterested).await?;
+                        }
+                        GossipMessage::Choke => {
+                            if !state.i_am_choking_peer {
+                                state.writer.send(Frame::Choke).await?;
+                                state.i_am_choking_peer = true;
+                            }
                         }
                     }
                 }
@@ -413,13 +418,19 @@ fn peer_loop(
                         None => break,
                         Some(m) => {
                             match m {
-                                TorrentToPeer::Choke => {
-                                    state.i_am_choking_peer = true;
-                                    state.writer.send(Frame::Choke).await?;
-                                }
+                                // TorrentToPeer::Choke => {
+                                //     // if we ARE NOT choking peer, choke
+                                //     if !state.i_am_choking_peer {
+                                //         state.writer.send(Frame::Choke).await?;
+                                //         state.i_am_choking_peer = true;
+                                //     }
+                                // }
                                 TorrentToPeer::Unchoke => {
-                                    state.i_am_choking_peer = false;
-                                    state.writer.send(Frame::Unchoke).await?;
+                                    // if we ARE choking peer, unchoke
+                                    if state.i_am_choking_peer {
+                                        state.writer.send(Frame::Unchoke).await?;
+                                        state.i_am_choking_peer = false;
+                                    }
                                 }
                                 TorrentToPeer::Shutdown => {
                                     debug!("peer received shutdown, shutting down");
@@ -729,11 +740,18 @@ impl PeerHandle {
             self.task_handle.abort();
         }
     }
+
     pub(crate) async fn unchoke(&self) {
         if let Err(_elapsed) = timeout!(self.peer_tx.send(TorrentToPeer::Unchoke), 5).await {
             self.task_handle.abort();
         }
     }
+
+    // pub(crate) async fn choke(&self) {
+    //     if let Err(_elapsed) = timeout!(self.peer_tx.send(TorrentToPeer::Choke), 5).await {
+    //         self.task_handle.abort();
+    //     }
+    // }
 }
 
 #[cfg(test)]
