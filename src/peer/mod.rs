@@ -498,7 +498,7 @@ async fn handle_have(state: &mut State, index: u32) -> Result<(), Error> {
     state.peer_pieces.set(index.try_into().unwrap(), true);
 
     let my_pieces = state.my_pieces.read().await;
-    if peer_has_pieces_we_want(&my_pieces, &state.peer_pieces).await? {
+    if peer_has_pieces_we_want(&my_pieces, &state.peer_pieces)? {
         state.i_am_interested_in_peer = true;
     }
 
@@ -672,7 +672,7 @@ async fn maybe_enqueue_requests(state: &mut State) -> Result<(), Error> {
     if should_download(state) {
         let unhad_pieces = {
             let my_pieces = state.my_pieces.read().await;
-            unhad_pieces(&my_pieces, &state.peer_pieces).await?
+            unhad_pieces(&my_pieces, &state.peer_pieces)?
         };
 
         // let metainfos = METAINFOS.read().await;
@@ -714,12 +714,12 @@ fn should_download(state: &mut State) -> bool {
     state.i_am_interested_in_peer && !state.peer_is_choking_me
 }
 
-async fn unhad_pieces(my_pieces: &Pieces, peer_pieces: &Pieces) -> Result<Pieces, Error> {
+fn unhad_pieces(my_pieces: &Pieces, peer_pieces: &Pieces) -> Result<Pieces, Error> {
     Ok(right_but_not_left(my_pieces, peer_pieces))
 }
 
-async fn peer_has_pieces_we_want(my_pieces: &Pieces, peer_pieces: &Pieces) -> Result<bool, Error> {
-    Ok(unhad_pieces(my_pieces, peer_pieces).await?.any())
+fn peer_has_pieces_we_want(my_pieces: &Pieces, peer_pieces: &Pieces) -> Result<bool, Error> {
+    Ok(unhad_pieces(my_pieces, peer_pieces)?.any())
 }
 
 #[derive(Debug)]
