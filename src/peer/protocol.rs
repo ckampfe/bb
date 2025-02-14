@@ -445,7 +445,7 @@ mod tests {
     use crate::torrent::Pieces;
     use crate::InfoHash;
     use futures::SinkExt;
-    use rand::{thread_rng, Rng};
+    use rand::Rng;
     use tokio_stream::StreamExt;
     use tokio_util::codec::{FramedRead, FramedWrite};
 
@@ -454,7 +454,7 @@ mod tests {
         let buf = vec![];
         let mut writer = FramedWrite::new(buf, HandshakeProtocol::new());
 
-        let mut rng = thread_rng();
+        let mut rng = rand::rng();
 
         let mut info_hash: [u8; 20] = [0; 20];
         rng.fill(&mut info_hash[..]);
@@ -561,9 +561,9 @@ mod tests {
         let buf = vec![];
         let mut writer = FramedWrite::new(buf, PeerProtocol::new());
 
-        let mut rng = thread_rng();
+        let mut rng = rand::rng();
 
-        let raw_pieces_length = rng.gen_range(0..500);
+        let raw_pieces_length = rng.random_range(0..500);
         let mut pieces_raw = vec![0; raw_pieces_length];
         rng.fill(&mut pieces_raw[..]);
 
@@ -621,11 +621,11 @@ mod tests {
         let buf = vec![];
         let mut writer = FramedWrite::new(buf, PeerProtocol::new());
 
-        let mut rng = thread_rng();
+        let mut rng = rand::rng();
 
         let index = rand::random();
         let begin = rand::random();
-        let block_length = rng.gen_range(0..500);
+        let block_length = rng.random_range(0..500);
         let mut block = vec![0; block_length];
         rng.fill(&mut block[..]);
 

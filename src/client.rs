@@ -47,7 +47,7 @@ impl Client {
 
         let port = match options.listen_port {
             Port::Port(p) => p,
-            Port::Random => rand::thread_rng().gen(),
+            Port::Random => rand::rng().random(),
         };
 
         let torrents: Arc<RwLock<BTreeMap<InfoHash, TorrentHandle>>> =

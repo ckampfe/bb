@@ -252,7 +252,7 @@ pub(crate) async fn new<P: AsRef<Path>>(
 
     let port = match options.port {
         Port::Port(port) => port,
-        Port::Random => rand::thread_rng().gen::<u16>(),
+        Port::Random => rand::rng().random::<u16>(),
     };
 
     let max_peer_connections = Arc::new(Semaphore::new(options.max_connections));
@@ -499,7 +499,7 @@ impl State {
         let mut idxs = BTreeSet::new();
 
         while idxs.len() < n && idxs.len() < self.connected_peers.len() {
-            let idx = rand::thread_rng().gen_range(0..self.connected_peers.len());
+            let idx = rand::rng().random_range(0..self.connected_peers.len());
             idxs.insert(idx);
         }
 
@@ -521,7 +521,7 @@ impl State {
     async fn evaluate_and_connect_to_peers(&mut self) {
         if self.max_peer_connections.available_permits() == 0 {
             for _ in 0..3 {
-                let idx = rand::thread_rng().gen_range(0..self.connected_peers.len());
+                let idx = rand::rng().random_range(0..self.connected_peers.len());
 
                 if let Some(peer) = self.connected_peers.get(idx) {
                     peer.shutdown().await;
