@@ -4,7 +4,7 @@ use nom::character::complete::digit1;
 use nom::combinator::opt;
 use nom::error::ErrorKind;
 use nom::multi::many0;
-use nom::IResult;
+use nom::{IResult, Parser};
 use std::collections::BTreeMap;
 use std::fmt::Debug;
 use std::io::Write;
@@ -166,19 +166,19 @@ pub(crate) fn encode<W: Write>(bencode: &Bencode, out: &mut W) -> Result<(), Err
 }
 
 fn any(input: &[u8]) -> IResult<&[u8], Bencode, CustomError<&[u8]>> {
-    alt((dict, list, string, integer))(input)
+    alt((dict, list, string, integer)).parse(input)
 }
 
 fn dict(input: &[u8]) -> IResult<&[u8], Bencode, CustomError<&[u8]>> {
-    let (input, _) = tag(b"d")(input)?;
+    let (input, _) = tag("d").parse(input)?;
     let (input, map) = kvs(input)?;
-    let (input, _) = tag(b"e")(input)?;
+    let (input, _) = tag("e").parse(input)?;
 
     Ok((input, Bencode::Dict(map)))
 }
 
 fn kvs(input: &[u8]) -> IResult<&[u8], BTreeMap<String, Bencode>, CustomError<&[u8]>> {
-    let (input, pairs) = many0(kv)(input)?;
+    let (input, pairs) = many0(kv).parse(input)?;
     let map = BTreeMap::from_iter(pairs);
     Ok((input, map))
 }
@@ -190,18 +190,18 @@ fn kv(input: &[u8]) -> IResult<&[u8], (String, Bencode), CustomError<&[u8]>> {
 }
 
 fn list(input: &[u8]) -> IResult<&[u8], Bencode, CustomError<&[u8]>> {
-    let (input, _) = tag(b"l")(input)?;
-    let (input, vec) = many0(any)(input)?;
-    let (input, _) = tag(b"e")(input)?;
+    let (input, _) = tag("l").parse(input)?;
+    let (input, vec) = many0(any).parse(input)?;
+    let (input, _) = tag("e").parse(input)?;
 
     Ok((input, Bencode::List(vec)))
 }
 
 fn integer(input: &[u8]) -> IResult<&[u8], Bencode, CustomError<&[u8]>> {
-    let (input, _) = tag(b"i")(input)?;
-    let (input, is_negative) = opt(tag(b"-"))(input)?;
+    let (input, _) = tag("i").parse(input)?;
+    let (input, is_negative) = opt(tag("-")).parse(input)?;
     let (input, digits) = digit1(input)?;
-    let (input, _) = tag(b"e")(input)?;
+    let (input, _) = tag("e").parse(input)?;
 
     let as_str = std::str::from_utf8(digits).unwrap();
     let mut i = as_str.parse::<i64>().unwrap();
@@ -219,8 +219,8 @@ fn dict_key(input: &[u8]) -> IResult<&[u8], &str, CustomError<&[u8]>> {
     let length = as_str
         .parse::<u64>()
         .map_err(|e| nom::Err::Error(CustomError::NotDigits(e)))?;
-    let (input, _) = tag(b":")(input)?;
-    let (input, s) = take(length)(input)?;
+    let (input, _) = tag(":").parse(input)?;
+    let (input, s) = take(length).parse(input)?;
     Ok((
         input,
         std::str::from_utf8(s).map_err(|e| nom::Err::Error(CustomError::NotUtf8(e)))?,
@@ -231,7 +231,7 @@ fn string(input: &[u8]) -> IResult<&[u8], Bencode, CustomError<&[u8]>> {
     let (input, digits) = digit1(input)?;
     let as_str = std::str::from_utf8(digits).unwrap();
     let length = as_str.parse::<u64>().unwrap();
-    let (input, _) = tag(b":")(input)?;
+    let (input, _) = tag(":").parse(input)?;
     let (input, s) = take(length)(input)?;
     Ok((input, Bencode::ByteString(s.to_vec())))
 }
